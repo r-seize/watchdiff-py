@@ -85,14 +85,10 @@ jobs:
           enable-cache: true
 
       - name: Build wheel and sdist
-        run: |
-          uv pip install build
-          python -m build
+        run: uv build
 
       - name: Verify package with twine
-        run: |
-          uv pip install twine
-          twine check dist/*
+        run: uvx twine check dist/*
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
