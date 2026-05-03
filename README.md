@@ -20,13 +20,13 @@ Most change detection tools compare raw HTML - which means every minor script re
 ## Install
 
 ```bash
-pip install watchdiff
+pip install watchdiff-core
 ```
 
 Or with [uv](https://github.com/astral-sh/uv):
 
 ```bash
-uv add watchdiff
+uv add watchdiff-core
 ```
 
 

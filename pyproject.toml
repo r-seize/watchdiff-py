@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "watchdiff"
-version = "0.1.1"
+name = "watchdiff-core"
+version = "0.1.2"
 description = "Lightweight web change monitoring library - clean diffs, structured alerts, no AI required."
 readme = "README.md"
 requires-python = ">=3.14"
