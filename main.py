@@ -197,13 +197,12 @@ def _render_report(report: DiffReport) -> None:
 
     lines = [f"[bold]{report.summary()}[/]\n"]
     for change in report.changes:
-        match change.kind.value:
-            case "added":
-                lines.append(f"  [green][+][/] {change.after}")
-            case "removed":
-                lines.append(f"  [red][-][/] {change.before}")
-            case "modified":
-                lines.append(f"  [yellow][~][/] {change.before} [dim]→[/] {change.after}")
+        if change.kind.value == "added":
+            lines.append(f"  [green][+][/] {change.after}")
+        elif change.kind.value == "removed":
+            lines.append(f"  [red][-][/] {change.before}")
+        elif change.kind.value == "modified":
+            lines.append(f"  [yellow][~][/] {change.before} [dim]->[/] {change.after}")
 
     console.print(Panel("\n".join(lines), title="Changes detected", border_style="yellow"))
 
