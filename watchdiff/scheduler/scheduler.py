@@ -17,14 +17,14 @@ import threading
 import time
 from typing import Any, Callable
 
-_NEVER = 0.0  # sentinel - "never alerted before"
-
 from watchdiff.cleaner import Cleaner
 from watchdiff.diff import DiffEngine
-from watchdiff.fetcher import AsyncFetcher, FetchError, Fetcher
+from watchdiff.fetcher import AsyncFetcher, Fetcher
 from watchdiff.models import DiffReport, WatchConfig
 from watchdiff.notifier import Notifier
 from watchdiff.parser import Parser, ParserError
+
+_NEVER = 0.0  # sentinel - "never alerted before"
 
 logger = logging.getLogger(__name__)
 

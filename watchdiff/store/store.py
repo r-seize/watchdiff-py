@@ -16,7 +16,6 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 from watchdiff.models import DiffReport, Snapshot
 
