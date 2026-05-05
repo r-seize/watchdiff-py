@@ -5,9 +5,9 @@ Format: one JSON file per watched URL, stored in a configurable directory.
 Each file contains an ordered list of Snapshot dicts (newest last).
 
 Why JSON and not SQLite?
-  → Zero external dependencies for storage.
-  → Easy to inspect, back up, or pipe to other tools.
-  → Fine for typical monitoring workloads (< thousands of entries).
+  - Zero external dependencies for storage.
+  - Easy to inspect, back up, or pipe to other tools.
+  - Fine for typical monitoring workloads (< thousands of entries).
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from watchdiff.models import DiffReport, Snapshot
 
@@ -66,6 +67,9 @@ class Store:
         path = self._snapshot_path(url, target)
         if path.exists():
             path.unlink()
+        report_path = self._report_path(url, target)
+        if report_path.exists():
+            report_path.unlink()
 
     # ------------------------------------------------------------------
     # Diff reports
@@ -123,22 +127,22 @@ class Store:
 
 def _snapshot_to_dict(s: Snapshot) -> dict:
     return {
-        "url": s.url,
-        "target": s.target,
-        "content": s.content,
-        "raw_html": s.raw_html,
-        "captured_at": s.captured_at.isoformat(),
-        "checksum": s.checksum,
+        "url":          s.url,
+        "target":       s.target,
+        "content":      s.content,
+        "raw_html":     s.raw_html,
+        "captured_at":  s.captured_at.isoformat(),
+        "checksum":     s.checksum,
     }
 
 
 def _dict_to_snapshot(d: dict) -> Snapshot:
-    snap = Snapshot(
-        url         = d["url"],
-        target      = d.get("target"),
-        content     = d["content"],
-        raw_html    = d.get("raw_html", ""),
+    snap             = Snapshot(
+        url      = d["url"],
+        target   = d.get("target"),
+        content  = d["content"],
+        raw_html = d.get("raw_html", ""),
     )
-    snap.captured_at    = datetime.fromisoformat(d["captured_at"])
-    snap.checksum       = d["checksum"]
+    snap.captured_at = datetime.fromisoformat(d["captured_at"])
+    snap.checksum    = d["checksum"]
     return snap
