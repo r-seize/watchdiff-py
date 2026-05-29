@@ -2,10 +2,12 @@
 WatchDiff CLI - monitor URLs from the terminal.
 
 Usage:
-    watchdiff init                                      # generate watchdiff.config.json
-    watchdiff run https://example.com --target .price   # continuous monitoring
-    watchdiff run --config watchdiff.config.json        # run from config file
+    watchdiff init                                       # generate watchdiff.config.json
+    watchdiff run https://example.com --target .price    # continuous monitoring
+    watchdiff run --config watchdiff.config.json         # run from config file
     watchdiff check https://example.com --target .price
+    watchdiff diff  https://example.com --target .price  # compare last 2 snapshots
+    watchdiff status                                     # show snapshot state per URL
     watchdiff history https://example.com --target .price
     watchdiff reports https://example.com
     watchdiff clear https://example.com
@@ -36,15 +38,14 @@ console = Console()
 # Shared options
 # ---------------------------------------------------------------------------
 
-_URL_ARG        = typer.Argument(..., help="URL to monitor.")
-_TARGET_OPT     = typer.Option(None, "--target", "-t", help="CSS selector or XPath to watch.")
-_INTERVAL_OPT   = typer.Option(300, "--interval", "-i", help="Seconds between checks.")
-_STORAGE_OPT    = typer.Option(".watchdiff", "--storage", "-s", help="Storage directory.")
-_LIMIT_OPT      = typer.Option(20, "--limit", "-n", help="Number of entries to show.")
-_VERBOSE_OPT    = typer.Option(False, "--verbose", "-v", help="Enable debug logging.")
+_URL_ARG      = typer.Argument(..., help="URL to monitor.")
+_TARGET_OPT   = typer.Option(None, "--target", "-t", help="CSS selector or XPath to watch.")
+_INTERVAL_OPT = typer.Option(300, "--interval", "-i", help="Seconds between checks.")
+_STORAGE_OPT  = typer.Option(".watchdiff", "--storage", "-s", help="Storage directory.")
+_LIMIT_OPT    = typer.Option(20, "--limit", "-n", help="Number of entries to show.")
+_VERBOSE_OPT  = typer.Option(False, "--verbose", "-v", help="Enable debug logging.")
 
-# Default config file name for auto-discovery
-_CONFIG_FILE    = "watchdiff.config.json"
+_CONFIG_FILE  = "watchdiff.config.json"
 
 
 # ---------------------------------------------------------------------------
@@ -59,39 +60,42 @@ def cmd_init(
     """Generate a watchdiff.config.json template."""
     dest = Path(output)
     if dest.exists() and not force:
-        console.print(
-            f"[yellow]{dest}[/] already exists. Use [bold]--force[/] to overwrite."
-        )
+        console.print(f"[yellow]{dest}[/] already exists. Use [bold]--force[/] to overwrite.")
         raise typer.Exit(1)
 
     template = {
         "storage": ".watchdiff",
         "watchers": [
             {
-                "url":              "https://example.com",
-                "target":           ".price",
-                "interval":         300,
-                "label":            "Example price tracker",
-                "diff_mode":        "line",
-                "browser":          False,
-                "cooldown":         0,
-                "webhooks":         [],
-                "proxies":          [],
-                "user_agents":      [],
-                "ignore_selectors": [],
-                "ignore_patterns":  [],
-                "timeout":          15,
-                "headers":          {},
+                "url":                      "https://example.com",
+                "target":                   ".price",
+                "interval":                 300,
+                "label":                    "Example price tracker",
+                "diff_mode":                "line",
+                "browser":                  False,
+                "cooldown":                 0,
+                "retries":                  0,
+                "retry_delay":              1.0,
+                "jitter":                   0.0,
+                "dry_run":                  False,
+                "max_snapshots":            None,
+                "change_threshold":         None,
+                "ignore_numbers":           False,
+                "alert_if_no_change_after": None,
+                "webhooks":                 [],
+                "proxies":                  [],
+                "user_agents":              [],
+                "ignore_selectors":         [],
+                "ignore_patterns":          [],
+                "timeout":                  15,
+                "headers":                  {},
             }
         ],
     }
 
     dest.write_text(json.dumps(template, indent=2, ensure_ascii=False), encoding="utf-8")
     console.print(f"[green]Created[/] {dest}")
-    console.print(
-        "Edit the file, then run: [bold cyan]watchdiff run --config "
-        f"{dest}[/]"
-    )
+    console.print(f"Edit the file, then run: [bold cyan]watchdiff run --config {dest}[/]")
 
 
 @app.command("run")
@@ -102,20 +106,26 @@ def cmd_run(
     storage: str            = _STORAGE_OPT,
     webhook: list[str]      = typer.Option([], "--webhook", "-w", help="Webhook URL (repeatable)."),
     verbose: bool           = _VERBOSE_OPT,
-    diff_mode: str          = typer.Option("line", "--diff-mode", help="Diff mode: line | semantic."),
+    quiet: bool             = typer.Option(False, "--quiet", "-q", help="Suppress change output."),
+    diff_mode: str          = typer.Option("line", "--diff-mode", help="Diff mode: line | semantic | word | json."),
     browser: bool           = typer.Option(False, "--browser", help="Use headless browser (Playwright)."),
     cooldown: int           = typer.Option(0, "--cooldown", help="Min seconds between alerts (0 = off)."),
-    config_file: str | None = typer.Option(None, "--config", "-c",
-                                           help="Load watchers from a config JSON file."),
+    dry_run: bool           = typer.Option(False, "--dry-run", help="Fetch+diff without saving or alerting."),
+    retries: int            = typer.Option(0, "--retries", help="HTTP retry attempts on transient errors."),
+    jitter: float           = typer.Option(0.0, "--jitter", help="Interval jitter fraction 0.0-1.0."),
+    max_snapshots: int      = typer.Option(0, "--max-snapshots", help="Max snapshots to keep (0 = unlimited)."),
+    change_threshold: float = typer.Option(0.0, "--change-threshold", help="Min change ratio 0.0-1.0 (0 = off)."),
+    ignore_numbers: bool    = typer.Option(False, "--ignore-numbers", help="Strip digit tokens before diffing."),
+    config_file: str | None = typer.Option(None, "--config", "-c", help="Load watchers from a JSON config file."),
 ) -> None:
     """Start continuous monitoring of a URL or a config file."""
     _setup_logging(verbose)
 
     def _print_report(report: DiffReport) -> None:
-        _render_report(report)
+        if not quiet:
+            _render_report(report)
 
     if config_file or (url is None and Path(_CONFIG_FILE).exists()):
-        # Run from config file
         file_path = Path(config_file) if config_file else Path(_CONFIG_FILE)
         _run_from_config(file_path, _print_report)
         return
@@ -130,24 +140,34 @@ def cmd_run(
     wd = WatchDiff(storage_dir=storage)
     wd.watch(
         url,
-        target    = target,
-        interval  = interval,
-        webhooks  = webhook or [],
-        diff_mode = diff_mode,
-        browser   = browser,
-        cooldown  = cooldown,
+        target           = target,
+        interval         = interval,
+        webhooks         = webhook or [],
+        diff_mode        = diff_mode,
+        browser          = browser,
+        cooldown         = cooldown,
+        dry_run          = dry_run,
+        retries          = retries,
+        jitter           = jitter,
+        max_snapshots    = max_snapshots or None,
+        change_threshold = change_threshold or None,
+        ignore_numbers   = ignore_numbers,
     )
     wd.on_change(_print_report)
 
-    cooldown_label = f"{cooldown}s" if cooldown > 0 else "off"
+    cooldown_label  = f"{cooldown}s" if cooldown > 0 else "off"
+    dry_run_label   = "[yellow]dry-run[/]" if dry_run else "off"
     console.print(
         Panel(
             f"[bold cyan]WatchDiff[/] monitoring [green]{url}[/]\n"
             f"Target:    [yellow]{target or 'full page'}[/]  "
-            f"Interval:  [yellow]{interval}s[/]\n"
+            f"Interval:  [yellow]{interval}s[/]  "
+            f"Jitter:    [yellow]{jitter}[/]\n"
             f"Diff mode: [yellow]{diff_mode}[/]  "
             f"Browser:   [yellow]{browser}[/]  "
             f"Cooldown:  [yellow]{cooldown_label}[/]\n"
+            f"Retries:   [yellow]{retries}[/]  "
+            f"Dry-run:   {dry_run_label}\n"
             f"Press [bold]Ctrl+C[/] to stop.",
             title="WatchDiff",
         )
@@ -162,15 +182,30 @@ def cmd_check(
     storage: str            = _STORAGE_OPT,
     verbose: bool           = _VERBOSE_OPT,
     output_json: bool       = typer.Option(False, "--json", help="Output raw JSON."),
-    diff_mode: str          = typer.Option("line", "--diff-mode", help="Diff mode: line | semantic."),
+    diff_mode: str          = typer.Option("line", "--diff-mode", help="Diff mode: line | semantic | word | json."),
     browser: bool           = typer.Option(False, "--browser", help="Use headless browser."),
     cooldown: int           = typer.Option(0, "--cooldown", help="Min seconds between alerts (0 = off)."),
+    dry_run: bool           = typer.Option(False, "--dry-run", help="Fetch+diff without saving or alerting."),
+    retries: int            = typer.Option(0, "--retries", help="HTTP retry attempts on transient errors."),
+    ignore_numbers: bool    = typer.Option(False, "--ignore-numbers", help="Strip digit tokens before diffing."),
+    change_threshold: float = typer.Option(0.0, "--change-threshold", help="Min change ratio (0 = off)."),
 ) -> None:
     """Run a single check and print the result."""
     _setup_logging(verbose)
 
     wd = WatchDiff(storage_dir=storage)
-    wd.watch(url, target=target, interval=0, diff_mode=diff_mode, browser=browser, cooldown=cooldown)
+    wd.watch(
+        url,
+        target           = target,
+        interval         = 0,
+        diff_mode        = diff_mode,
+        browser          = browser,
+        cooldown         = cooldown,
+        dry_run          = dry_run,
+        retries          = retries,
+        ignore_numbers   = ignore_numbers,
+        change_threshold = change_threshold or None,
+    )
 
     report = wd.check_once(url)
 
@@ -184,12 +219,98 @@ def cmd_check(
         _render_report(report)
 
 
+@app.command("diff")
+def cmd_diff(
+    url: str           = _URL_ARG,
+    target: str | None = _TARGET_OPT,
+    storage: str       = _STORAGE_OPT,
+    output_json: bool  = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Compare the last two stored snapshots for a URL."""
+    from watchdiff.diff import DiffEngine
+    from watchdiff.models import WatchConfig as _WatchConfig
+    from watchdiff.store import Store
+
+    store   = Store(storage)
+    history = store.load_history(url, target, limit=2)
+
+    if len(history) < 2:
+        console.print(
+            "[yellow]Not enough snapshots to compare.[/] "
+            "Need at least 2 - run [bold]watchdiff check[/] first."
+        )
+        raise typer.Exit(0)
+
+    before, after = history[-2], history[-1]
+    engine        = DiffEngine()
+    report        = engine.compare(before, after, _WatchConfig(url=url, target=target))
+
+    if output_json:
+        typer.echo(json.dumps(report.as_dict(), indent=2, ensure_ascii=False))
+    else:
+        _render_report(report)
+
+
+@app.command("status")
+def cmd_status(
+    storage: str            = _STORAGE_OPT,
+    config_file: str | None = typer.Option(None, "--config", "-c",
+                                            help="Config file to read URLs from."),
+) -> None:
+    """Show last snapshot info for all watched URLs (reads from config file)."""
+    from watchdiff.store import Store
+
+    file_path = Path(config_file) if config_file else Path(_CONFIG_FILE)
+    if not file_path.exists():
+        console.print(
+            f"[yellow]Config file {file_path} not found.[/] "
+            "Create one with [bold]watchdiff init[/]."
+        )
+        raise typer.Exit(1)
+
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        console.print(f"[red]Failed to read config:[/] {exc}")
+        raise typer.Exit(1)
+
+    store    = Store(data.get("storage", storage))
+    watchers = data.get("watchers", [])
+
+    if not watchers:
+        console.print("[yellow]No watchers defined.[/]")
+        raise typer.Exit(0)
+
+    table = Table(title="WatchDiff Status", show_lines=True)
+    table.add_column("Label",         style="cyan")
+    table.add_column("URL")
+    table.add_column("Target",        style="dim")
+    table.add_column("Last snapshot", style="green")
+    table.add_column("Snapshots",     justify="right")
+
+    for w in watchers:
+        url_w   = w["url"]
+        target_w = w.get("target")
+        label_w  = w.get("label") or url_w
+        snaps    = store.load_history(url_w, target_w, limit=9999)
+        latest   = snaps[-1] if snaps else None
+        table.add_row(
+            label_w,
+            url_w,
+            target_w or "full page",
+            latest.captured_at.strftime("%Y-%m-%d %H:%M:%S") if latest else "-",
+            str(len(snaps)),
+        )
+
+    console.print(table)
+
+
 @app.command("history")
 def cmd_history(
-    url: str                = _URL_ARG,
-    target: str | None      = _TARGET_OPT,
-    storage: str            = _STORAGE_OPT,
-    limit: int              = _LIMIT_OPT,
+    url: str           = _URL_ARG,
+    target: str | None = _TARGET_OPT,
+    storage: str       = _STORAGE_OPT,
+    limit: int         = _LIMIT_OPT,
 ) -> None:
     """Show snapshot history for a URL."""
     from watchdiff.store import Store
@@ -203,7 +324,7 @@ def cmd_history(
 
     table = Table(title=f"Snapshot history - {url}", show_lines=True)
     table.add_column("Captured at", style="cyan")
-    table.add_column("Checksum", style="dim")
+    table.add_column("Checksum",    style="dim")
     table.add_column("Content preview")
 
     for snap in reversed(snapshots):
@@ -219,16 +340,16 @@ def cmd_history(
 
 @app.command("reports")
 def cmd_reports(
-    url: str            = _URL_ARG,
-    target: str | None  = _TARGET_OPT,
-    storage: str        = _STORAGE_OPT,
-    limit: int          = _LIMIT_OPT,
+    url: str           = _URL_ARG,
+    target: str | None = _TARGET_OPT,
+    storage: str       = _STORAGE_OPT,
+    limit: int         = _LIMIT_OPT,
 ) -> None:
     """Show diff reports for a URL."""
     from watchdiff.store import Store
 
-    store   = Store(storage)
-    rpts    = store.load_reports(url, target, limit=limit)
+    store = Store(storage)
+    rpts  = store.load_reports(url, target, limit=limit)
 
     if not rpts:
         console.print("[yellow]No reports found.[/]")
@@ -250,10 +371,10 @@ def cmd_reports(
 
 @app.command("clear")
 def cmd_clear(
-    url: str                = _URL_ARG,
-    target: str | None      = _TARGET_OPT,
-    storage: str            = _STORAGE_OPT,
-    yes: bool               = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+    url: str           = _URL_ARG,
+    target: str | None = _TARGET_OPT,
+    storage: str       = _STORAGE_OPT,
+    yes: bool          = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
 ) -> None:
     """Delete all stored snapshots and reports for a URL."""
     if not yes:
@@ -306,20 +427,28 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
 
         wd.watch(
             w["url"],
-            target           = w.get("target"),
-            interval         = w.get("interval", 300),
-            label            = w.get("label"),
-            headers          = w.get("headers", {}),
-            timeout          = w.get("timeout", 15),
-            ignore_selectors = w.get("ignore_selectors", []),
-            ignore_patterns  = w.get("ignore_patterns", []),
-            webhooks         = w.get("webhooks", []),
-            diff_mode        = w.get("diff_mode", "line"),
-            browser          = w.get("browser", False),
-            browser_options  = bo,
-            proxies          = w.get("proxies", []),
-            user_agents      = w.get("user_agents", []),
-            cooldown         = w.get("cooldown", 0),
+            target                   = w.get("target"),
+            interval                 = w.get("interval", 300),
+            label                    = w.get("label"),
+            headers                  = w.get("headers", {}),
+            timeout                  = w.get("timeout", 15),
+            ignore_selectors         = w.get("ignore_selectors", []),
+            ignore_patterns          = w.get("ignore_patterns", []),
+            webhooks                 = w.get("webhooks", []),
+            diff_mode                = w.get("diff_mode", "line"),
+            browser                  = w.get("browser", False),
+            browser_options          = bo,
+            proxies                  = w.get("proxies", []),
+            user_agents              = w.get("user_agents", []),
+            cooldown                 = w.get("cooldown", 0),
+            retries                  = w.get("retries", 0),
+            retry_delay              = w.get("retry_delay", 1.0),
+            jitter                   = w.get("jitter", 0.0),
+            dry_run                  = w.get("dry_run", False),
+            max_snapshots            = w.get("max_snapshots"),
+            change_threshold         = w.get("change_threshold"),
+            ignore_numbers           = w.get("ignore_numbers", False),
+            alert_if_no_change_after = w.get("alert_if_no_change_after"),
         )
 
     wd.on_change(on_change_cb)  # type: ignore[arg-type]

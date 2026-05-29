@@ -61,6 +61,13 @@ class Store:
         history = self._load_raw(path)
         return [_dict_to_snapshot(d) for d in history[-limit:]]
 
+    def prune_snapshots(self, url: str, target: str | None, max_snapshots: int) -> None:
+        """Keep only the most recent max_snapshots entries, removing the rest."""
+        path    = self._snapshot_path(url, target)
+        history = self._load_raw(path)
+        if len(history) > max_snapshots:
+            self._save_raw(path, history[-max_snapshots:])
+
     def clear_history(self, url: str, target: str | None) -> None:
         """Delete all stored snapshots for a URL + target combo."""
         path = self._snapshot_path(url, target)

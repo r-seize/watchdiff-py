@@ -8,12 +8,17 @@ Two implementations:
 Both support:
   - User-Agent rotation (config.user_agents or built-in pool of 4)
   - Proxy rotation     (config.proxies - one picked randomly per request)
+  - Retry + exponential backoff (config.retries, config.retry_delay)
+    Retried: network errors, timeouts, 429, 5xx
+    Not retried: 4xx (except 429)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
+import time
 
 import httpx
 
@@ -42,6 +47,8 @@ _DEFAULT_USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
 
 def _pick_ua(config: WatchConfig) -> str:
     pool = config.user_agents if config.user_agents else _DEFAULT_USER_AGENTS
@@ -52,12 +59,16 @@ def _pick_proxy(config: WatchConfig) -> str | None:
     return random.choice(config.proxies) if config.proxies else None
 
 
+def _backoff(attempt: int, retry_delay: float) -> float:
+    return retry_delay * (2 ** attempt)
+
+
 class FetchError(Exception):
     """Raised when an HTTP request fails."""
 
 
 class Fetcher:
-    """Synchronous HTTP fetcher with UA and proxy rotation."""
+    """Synchronous HTTP fetcher with UA/proxy rotation and retry backoff."""
 
     def fetch(self, config: WatchConfig) -> str:
         """
@@ -67,7 +78,7 @@ class Fetcher:
             Raw HTML string.
 
         Raises:
-            FetchError: on network error or non-2xx response.
+            FetchError: after all retries are exhausted.
         """
         headers = {**_DEFAULT_ACCEPT_HEADERS, "User-Agent": _pick_ua(config), **config.headers}
         proxy   = _pick_proxy(config)
@@ -76,21 +87,35 @@ class Fetcher:
         if proxy:
             client_kwargs["proxy"] = proxy
 
-        try:
-            with httpx.Client(**client_kwargs) as client:
-                resp = client.get(config.url, headers=headers)
-                resp.raise_for_status()
-                return resp.text
-        except httpx.HTTPStatusError as exc:
-            raise FetchError(
-                f"HTTP {exc.response.status_code} for {config.url}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise FetchError(f"Request failed for {config.url}: {exc}") from exc
+        last_exc: Exception | None = None
+
+        for attempt in range(config.retries + 1):
+            if attempt > 0:
+                delay = _backoff(attempt - 1, config.retry_delay)
+                logger.debug("[%s] Retry %d/%d after %.1fs", config.label, attempt, config.retries, delay)
+                time.sleep(delay)
+            try:
+                with httpx.Client(**client_kwargs) as client:
+                    resp = client.get(config.url, headers=headers)
+                    if resp.status_code in _RETRYABLE_STATUS and attempt < config.retries:
+                        last_exc = FetchError(f"HTTP {resp.status_code} for {config.url}")
+                        continue
+                    resp.raise_for_status()
+                    return resp.text
+            except httpx.HTTPStatusError as exc:
+                last_exc = FetchError(f"HTTP {exc.response.status_code} for {config.url}")
+                if exc.response.status_code not in _RETRYABLE_STATUS or attempt >= config.retries:
+                    raise FetchError(f"HTTP {exc.response.status_code} for {config.url}") from exc
+            except httpx.RequestError as exc:
+                last_exc = FetchError(f"Request failed for {config.url}: {exc}")
+                if attempt >= config.retries:
+                    raise FetchError(f"Request failed for {config.url}: {exc}") from exc
+
+        raise last_exc or FetchError(f"All retries exhausted for {config.url}")
 
 
 class AsyncFetcher:
-    """Asynchronous HTTP fetcher with UA and proxy rotation."""
+    """Asynchronous HTTP fetcher with UA/proxy rotation and retry backoff."""
 
     async def fetch(self, config: WatchConfig) -> str:
         """
@@ -100,7 +125,7 @@ class AsyncFetcher:
             Raw HTML string.
 
         Raises:
-            FetchError: on network error or non-2xx response.
+            FetchError: after all retries are exhausted.
         """
         headers = {**_DEFAULT_ACCEPT_HEADERS, "User-Agent": _pick_ua(config), **config.headers}
         proxy   = _pick_proxy(config)
@@ -109,14 +134,28 @@ class AsyncFetcher:
         if proxy:
             client_kwargs["proxy"] = proxy
 
-        try:
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                resp = await client.get(config.url, headers=headers)
-                resp.raise_for_status()
-                return resp.text
-        except httpx.HTTPStatusError as exc:
-            raise FetchError(
-                f"HTTP {exc.response.status_code} for {config.url}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise FetchError(f"Request failed for {config.url}: {exc}") from exc
+        last_exc: Exception | None = None
+
+        for attempt in range(config.retries + 1):
+            if attempt > 0:
+                delay = _backoff(attempt - 1, config.retry_delay)
+                logger.debug("[%s] Retry %d/%d after %.1fs", config.label, attempt, config.retries, delay)
+                await asyncio.sleep(delay)
+            try:
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    resp = await client.get(config.url, headers=headers)
+                    if resp.status_code in _RETRYABLE_STATUS and attempt < config.retries:
+                        last_exc = FetchError(f"HTTP {resp.status_code} for {config.url}")
+                        continue
+                    resp.raise_for_status()
+                    return resp.text
+            except httpx.HTTPStatusError as exc:
+                last_exc = FetchError(f"HTTP {exc.response.status_code} for {config.url}")
+                if exc.response.status_code not in _RETRYABLE_STATUS or attempt >= config.retries:
+                    raise FetchError(f"HTTP {exc.response.status_code} for {config.url}") from exc
+            except httpx.RequestError as exc:
+                last_exc = FetchError(f"Request failed for {config.url}: {exc}")
+                if attempt >= config.retries:
+                    raise FetchError(f"Request failed for {config.url}: {exc}") from exc
+
+        raise last_exc or FetchError(f"All retries exhausted for {config.url}")

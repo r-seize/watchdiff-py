@@ -46,13 +46,13 @@ No noisy HTML diffs. No external services. No AI black boxes.
 
 ## Why WatchDiff?
 
-Most change detection tools compare raw HTML — which means every minor script reload or ad rotation triggers a false positive. WatchDiff strips the noise first, then diffs only the content that matters.
+Most change detection tools compare raw HTML - which means every minor script reload or ad rotation triggers a false positive. WatchDiff strips the noise first, then diffs only the content that matters.
 
-- **Deterministic** — same input always produces the same output
-- **Human-readable diffs** — "Price changed: $19 → $24", not a wall of HTML
-- **Zero external services** — snapshots stored locally (JSON or SQLite)
-- **Async-ready** — sync and async schedulers included
-- **Python 3.9+** — works on Debian Bullseye, Bookworm, and Trixie
+- **Deterministic** - same input always produces the same output
+- **Human-readable diffs** - "Price changed: $19 → $24", not a wall of HTML
+- **Zero external services** - snapshots stored locally (JSON or SQLite)
+- **Async-ready** - sync and async schedulers included
+- **Python 3.9+** - works on Debian Bullseye, Bookworm, and Trixie
 
 
 ## Install
@@ -155,9 +155,9 @@ wd.start()
 ```
 
 `wait_for` accepts:
-- `"load"` — default, waits for the `load` event
-- `"domcontentloaded"` — faster, waits for DOM only
-- `"networkidle"` — waits until no network requests for 500ms
+- `"load"` - default, waits for the `load` event
+- `"domcontentloaded"` - faster, waits for DOM only
+- `"networkidle"` - waits until no network requests for 500ms
 
 
 ### Proxy rotation and User-Agent rotation
@@ -181,12 +181,12 @@ wd.watch(
 
 If `user_agents` is empty, WatchDiff rotates automatically among **4 built-in modern UA strings** (Chrome, Safari, Firefox, Chrome Linux). No configuration required.
 
-Proxies also work in browser mode — Playwright passes the selected proxy to Chromium.
+Proxies also work in browser mode - Playwright passes the selected proxy to Chromium.
 
 
 ### Semantic diff mode
 
-By default, WatchDiff diffs line by line. In **semantic mode**, it extracts meaningful HTML blocks — `<p>`, `<h1>`-`<h6>`, `<li>`, `<td>`, `<th>`, `<blockquote>` — and diffs those instead. This gives cleaner results on content-heavy pages where a single paragraph change doesn't shift dozens of lines.
+By default, WatchDiff diffs line by line. In **semantic mode**, it extracts meaningful HTML blocks - `<p>`, `<h1>`-`<h6>`, `<li>`, `<td>`, `<th>`, `<blockquote>` - and diffs those instead. This gives cleaner results on content-heavy pages where a single paragraph change doesn't shift dozens of lines.
 
 ```python
 wd.watch(
@@ -221,12 +221,12 @@ wd.watch("https://example.com", target="(//h2)[1]")         # first <h2> only
 wd.watch("https://example.com", target="//p[contains(@class,'intro')]")
 ```
 
-XPath is implemented via `lxml` (already a dependency — no extra install needed).
+XPath is implemented via `lxml` (already a dependency - no extra install needed).
 
 
 ### SQLite storage backend
 
-By default, WatchDiff stores data as JSON files. For larger datasets or concurrent access, switch to the built-in SQLite backend — no extra dependencies required:
+By default, WatchDiff stores data as JSON files. For larger datasets or concurrent access, switch to the built-in SQLite backend - no extra dependencies required:
 
 ```python
 from watchdiff import WatchDiff
@@ -236,7 +236,7 @@ wd = WatchDiff(store=SqliteStore(".watchdiff.db"))
 wd.watch("https://example.com").start()
 ```
 
-`SqliteStore` is a **drop-in replacement** for the default `Store` — same interface, same behaviour. It runs in WAL mode for concurrent-read safety.
+`SqliteStore` is a **drop-in replacement** for the default `Store` - same interface, same behaviour. It runs in WAL mode for concurrent-read safety.
 
 
 ### CSV and XLSX export
@@ -259,10 +259,10 @@ path = wd.export_snapshots_xlsx("https://example.com", dest="snapshots.xlsx")
 ```
 
 All export methods accept:
-- `url` — the watched URL
-- `target` — CSS/XPath filter (optional, `None` = full page)
-- `limit` — max rows to include (default 500)
-- `dest` — file path to write (optional for CSV, required for XLSX)
+- `url` - the watched URL
+- `target` - CSS/XPath filter (optional, `None` = full page)
+- `limit` - max rows to include (default 500)
+- `dest` - file path to write (optional for CSV, required for XLSX)
 
 
 ### Cooldown anti-spam
@@ -281,7 +281,7 @@ wd.watch(
 
 Important: **changes are still detected and stored** during the cooldown period. Only the alerts (callbacks, webhooks) are suppressed. The full history remains available via `.history()` and `.reports()`.
 
-`cooldown=0` (default) disables the feature — every change triggers an alert immediately.
+`cooldown=0` (default) disables the feature - every change triggers an alert immediately.
 
 In the CLI:
 
@@ -420,7 +420,7 @@ Pass `block=False` to run in the background (daemon threads).
 
 #### `await .start_async()`
 
-Async variant — use inside an existing event loop (FastAPI, aiohttp, etc.):
+Async variant - use inside an existing event loop (FastAPI, aiohttp, etc.):
 
 ```python
 import asyncio
@@ -539,13 +539,13 @@ Options for check:
 
 ## Use cases
 
-- **E-commerce** — track product prices and stock availability
-- **News monitoring** — detect article updates or new publications
-- **Documentation** — alert when API docs or changelogs change
-- **Public APIs** — watch JSON endpoints for schema or value changes
-- **SPA / React apps** — monitor JS-rendered content with `browser=True`
-- **Compliance** — audit changes on public-facing pages over time
-- **Research** — collect snapshots for longitudinal content analysis
+- **E-commerce** - track product prices and stock availability
+- **News monitoring** - detect article updates or new publications
+- **Documentation** - alert when API docs or changelogs change
+- **Public APIs** - watch JSON endpoints for schema or value changes
+- **SPA / React apps** - monitor JS-rendered content with `browser=True`
+- **Compliance** - audit changes on public-facing pages over time
+- **Research** - collect snapshots for longitudinal content analysis
 
 
 ## Contributing

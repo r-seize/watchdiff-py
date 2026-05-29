@@ -3,21 +3,26 @@ Notifier - dispatches alerts when a DiffReport has changes.
 
 Supported channels:
   - Python callbacks (synchronous)
-  - Webhooks (Discord, Slack, custom - via httpx POST)
-
-Adding a new channel is as simple as adding a method and calling it
-inside `notify()`.
+  - Discord (discord.com)
+  - Slack (hooks.slack.com)
+  - Telegram (api.telegram.org) - chat_id extracted from URL query param
+  - Microsoft Teams (outlook.office.com / webhook.office.com / logic.azure.com)
+  - ntfy.sh (ntfy.sh or ntfy.) - title/priority via headers
+  - Generic JSON webhook (anything else)
 """
 
 from __future__ import annotations
 
 import logging
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
 from watchdiff.models import AlertConfig, DiffReport
 
 logger = logging.getLogger(__name__)
+
+_TEAMS_DOMAINS = ("outlook.office.com", "webhook.office.com", "logic.azure.com")
 
 
 class Notifier:
@@ -34,48 +39,84 @@ class Notifier:
         if len(report.changes) < alert.min_changes:
             return
 
-        # 1. Python callbacks
         for callback in alert.on_change:
             try:
                 callback(report)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Alert callback raised an error: %s", exc)
 
-        # 2. Webhooks
         for url in alert.webhooks:
             self._send_webhook(url, report)
 
     # ------------------------------------------------------------------
-    # Channels
+    # Internal
     # ------------------------------------------------------------------
 
     def _send_webhook(self, url: str, report: DiffReport) -> None:
-        """POST a JSON payload to a webhook URL.
-
-        Automatically adapts payload format for Discord vs Slack vs generic.
-        """
-        payload = self._build_payload(url, report)
+        payload, extra_headers = self._build_payload(url, report)
         try:
             with httpx.Client(timeout=10) as client:
-                resp = client.post(url, json=payload)
+                resp = client.post(url, json=payload, headers=extra_headers)
                 if not resp.is_success:
-                    logger.warning(
-                        "Webhook %s returned %d", url, resp.status_code
-                    )
+                    logger.warning("Webhook %s returned %d", url, resp.status_code)
         except httpx.RequestError as exc:
             logger.warning("Webhook request error (%s): %s", url, exc)
 
-    def _build_payload(self, url: str, report: DiffReport) -> dict:
-        """Build a webhook payload adapted to the target service."""
-        summary         = report.summary()
-        change_lines    = "\n".join(c.human() for c in report.changes[:20])
-        text            = f"{summary}\n\n{change_lines}"
+    def _build_payload(self, url: str, report: DiffReport) -> tuple[dict, dict]:
+        """Return (json_payload, extra_headers) adapted to the target service."""
+        summary      = report.summary()
+        change_lines = "\n".join(c.human() for c in report.changes[:20])
+        text         = f"{summary}\n\n{change_lines}"
 
         if "discord.com" in url:
-            return {"content": text[:2000]}  # Discord 2000-char limit
+            return {"content": text[:2000]}, {}
 
         if "hooks.slack.com" in url:
-            return {"text": text[:3000]}
+            return {"text": text[:3000]}, {}
 
-        # Generic JSON
-        return report.as_dict()
+        if "api.telegram.org" in url:
+            parsed  = urlparse(url)
+            chat_id = parse_qs(parsed.query).get("chat_id", [""])[0]
+            return {
+                "chat_id":    chat_id,
+                "text":       text[:4096],
+                "parse_mode": "HTML",
+            }, {}
+
+        if any(d in url for d in _TEAMS_DOMAINS):
+            return _teams_card(report, text), {}
+
+        if "ntfy." in url or "ntfy.sh" in url:
+            return {"message": text[:4096]}, {
+                "Title":    report.label,
+                "Priority": "default",
+                "Tags":     "bell",
+            }
+
+        return report.as_dict(), {}
+
+
+# ---------------------------------------------------------------------------
+# Teams MessageCard helper
+# ---------------------------------------------------------------------------
+
+def _teams_card(report: DiffReport, text: str) -> dict:
+    return {
+        "@type":       "MessageCard",
+        "@context":    "http://schema.org/extensions",
+        "themeColor":  "FF6600",
+        "summary":     report.summary(),
+        "sections": [
+            {
+                "activityTitle": f"WatchDiff - {report.label}",
+                "activityText":  report.summary(),
+                "facts": [
+                    {
+                        "name":  c.kind.value,
+                        "value": (c.after or c.before or "")[:200],
+                    }
+                    for c in report.changes[:10]
+                ],
+            }
+        ],
+    }

@@ -26,6 +26,8 @@ class DiffMode(str, Enum):
     """Strategy used by DiffEngine to compare snapshots."""
     LINE     = "line"      # default - line-by-line diff
     SEMANTIC = "semantic"  # block-level diff on <p>, <h1-h6>, <li>, <td>, <th>, <blockquote>
+    WORD     = "word"      # word-by-word diff, coalescence removed+added -> modified
+    JSON     = "json"      # recursive key-path diff, fallback line if not valid JSON
 
 
 # ---------------------------------------------------------------------------
@@ -46,21 +48,31 @@ class WatchConfig:
     """Configuration for a single watched URL."""
 
     url: str
-    target: str | None            = None          # CSS selector or XPath - None means full page
-    interval: int                 = 300                # seconds between checks
-    label: str | None             = None           # human-readable name for this watch
-    headers: dict[str, str]       = field(default_factory=dict)
-    timeout: int                  = 15                  # HTTP timeout in seconds
-    ignore_selectors: list[str]   = field(default_factory=list)  # CSS to strip
-    ignore_patterns: list[str]    = field(default_factory=list)   # regex patterns to strip
-    alert: AlertConfig | None     = None
-    # --- new in 0.1.3 ---
-    diff_mode: str                = "line"         # "line" | "semantic"
-    browser: bool                 = False          # use Playwright headless browser
+    target: str | None               = None     # CSS selector or XPath - None means full page
+    interval: int                    = 300       # seconds between checks
+    label: str | None                = None      # human-readable name for this watch
+    headers: dict[str, str]          = field(default_factory=dict)
+    timeout: int                     = 15        # HTTP timeout in seconds
+    ignore_selectors: list[str]      = field(default_factory=list)
+    ignore_patterns: list[str]       = field(default_factory=list)
+    alert: AlertConfig | None        = None
+    # --- new in 0.1.4 ---
+    diff_mode: str                   = "line"   # "line" | "semantic" | "word" | "json"
+    browser: bool                    = False
     browser_options: BrowserOptions | None = None
-    proxies: list[str]            = field(default_factory=list)   # rotated randomly per request
-    user_agents: list[str]        = field(default_factory=list)   # rotated randomly per request
-    cooldown: int                 = 0              # min seconds between two alerts (0 = disabled)
+    proxies: list[str]               = field(default_factory=list)
+    user_agents: list[str]           = field(default_factory=list)
+    cooldown: int                    = 0        # min seconds between two alerts (0 = disabled)
+    retries: int                     = 0        # HTTP retry attempts on transient errors
+    retry_delay: float               = 1.0      # base delay in seconds for exponential backoff
+    jitter: float                    = 0.0      # fraction 0-1: interval ± interval*jitter*rand
+    dry_run: bool                    = False    # fetch+diff without persisting or alerting
+    max_snapshots: int | None        = None     # prune history to this many entries after each save
+    change_threshold: float | None   = None     # min changed/total ratio to trigger alert
+    ignore_numbers: bool             = False    # strip all numbers before diffing
+    alert_if_no_change_after: int | None = None # fire on_silence if no change for N seconds
+    on_error: Callable[[Exception, WatchConfig], None] | None = None
+    on_silence: Callable[[SilenceInfo], None] | None = None
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -72,8 +84,8 @@ class AlertConfig:
     """Alert configuration attached to a WatchConfig."""
 
     on_change: list[Callable[[DiffReport], Any]] = field(default_factory=list)
-    webhooks: list[str]    = field(default_factory=list)   # Discord / Slack / custom URLs
-    min_changes: int       = 1               # trigger only if >= N changes
+    webhooks: list[str]    = field(default_factory=list)
+    min_changes: int       = 1
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +119,9 @@ class Change:
     """A single atomic change between two snapshots."""
 
     kind: ChangeType
-    before: str | None     = None          # old value / text
-    after: str | None      = None           # new value / text
-    context: str | None    = None         # surrounding text hint
+    before: str | None     = None
+    after: str | None      = None
+    context: str | None    = None
 
     def human(self) -> str:
         """Return a human-readable one-liner."""
@@ -181,3 +193,49 @@ class DiffReport:
                 for c in self.changes
             ],
         }
+
+
+# ---------------------------------------------------------------------------
+# Status / silence
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WatcherStatus:
+    """Live status snapshot for a single watcher."""
+
+    url: str
+    label: str
+    target: str | None
+    interval: int
+    paused: bool
+    last_check_at: datetime | None
+    next_check_at: datetime | None
+    last_change_at: datetime | None
+    checks_count: int
+    changes_count: int
+
+    def as_dict(self) -> dict:
+        def _iso(dt: datetime | None) -> str | None:
+            return dt.isoformat() if dt else None
+
+        return {
+            "url":            self.url,
+            "label":          self.label,
+            "target":         self.target,
+            "interval":       self.interval,
+            "paused":         self.paused,
+            "last_check_at":  _iso(self.last_check_at),
+            "next_check_at":  _iso(self.next_check_at),
+            "last_change_at": _iso(self.last_change_at),
+            "checks_count":   self.checks_count,
+            "changes_count":  self.changes_count,
+        }
+
+
+@dataclass
+class SilenceInfo:
+    """Payload passed to the on_silence callback."""
+
+    url: str
+    label: str
+    seconds_since_last_change: float

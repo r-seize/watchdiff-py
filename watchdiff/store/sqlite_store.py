@@ -104,6 +104,16 @@ class SqliteStore:
         ).fetchall()
         return [_row_to_snapshot(r) for r in reversed(rows)]
 
+    def prune_snapshots(self, url: str, target: str | None, max_snapshots: int) -> None:
+        """Keep only the most recent max_snapshots rows, removing older ones."""
+        key = self._key(url, target)
+        self._conn.execute(
+            "DELETE FROM snapshots WHERE url_key = ? AND id NOT IN "
+            "(SELECT id FROM snapshots WHERE url_key = ? ORDER BY id DESC LIMIT ?)",
+            (key, key, max_snapshots),
+        )
+        self._conn.commit()
+
     def clear_history(self, url: str, target: str | None) -> None:
         """Delete all snapshots and reports for a URL + target combo."""
         key = self._key(url, target)
