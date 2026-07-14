@@ -14,6 +14,7 @@ Supported channels:
 from __future__ import annotations
 
 import logging
+import time
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -22,7 +23,8 @@ from watchdiff.models import AlertConfig, DiffReport
 
 logger = logging.getLogger(__name__)
 
-_TEAMS_DOMAINS = ("outlook.office.com", "webhook.office.com", "logic.azure.com")
+_TEAMS_DOMAINS       = ("outlook.office.com", "webhook.office.com", "logic.azure.com")
+_RETRY_BASE_DELAY_S  = 0.5
 
 
 class Notifier:
@@ -46,21 +48,38 @@ class Notifier:
                 logger.warning("Alert callback raised an error: %s", exc)
 
         for url in alert.webhooks:
-            self._send_webhook(url, report)
+            self._send_webhook_with_retry(url, report, alert.webhook_retries)
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
+    def _send_webhook_with_retry(
+        self, url: str, report: DiffReport, max_retries: int
+    ) -> None:
+        max_attempts = max_retries + 1
+        last_exc: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._send_webhook(url, report)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < max_attempts:
+                    time.sleep(_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
+
+        logger.warning(
+            "Webhook failed after %d attempt(s) (%s): %s",
+            max_attempts, url, last_exc,
+        )
+
     def _send_webhook(self, url: str, report: DiffReport) -> None:
         payload, extra_headers = self._build_payload(url, report)
-        try:
-            with httpx.Client(timeout=10) as client:
-                resp = client.post(url, json=payload, headers=extra_headers)
-                if not resp.is_success:
-                    logger.warning("Webhook %s returned %d", url, resp.status_code)
-        except httpx.RequestError as exc:
-            logger.warning("Webhook request error (%s): %s", url, exc)
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(url, json=payload, headers=extra_headers)
+            if not resp.is_success:
+                raise Exception(f"Webhook {url} returned {resp.status_code}")  # noqa: TRY002
 
     def _build_payload(self, url: str, report: DiffReport) -> tuple[dict, dict]:
         """Return (json_payload, extra_headers) adapted to the target service."""

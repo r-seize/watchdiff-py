@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.config
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -39,13 +41,112 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 _URL_ARG      = typer.Argument(..., help="URL to monitor.")
-_TARGET_OPT   = typer.Option(None, "--target", "-t", help="CSS selector or XPath to watch.")
-_INTERVAL_OPT = typer.Option(300, "--interval", "-i", help="Seconds between checks.")
-_STORAGE_OPT  = typer.Option(".watchdiff", "--storage", "-s", help="Storage directory.")
-_LIMIT_OPT    = typer.Option(20, "--limit", "-n", help="Number of entries to show.")
-_VERBOSE_OPT  = typer.Option(False, "--verbose", "-v", help="Enable debug logging.")
+_TARGET_OPT   = typer.Option(None,    "--target",   "-t", help="CSS selector or XPath to watch.")
+_INTERVAL_OPT = typer.Option(300,     "--interval", "-i", help="Seconds between checks.",
+                              envvar="WATCHDIFF_INTERVAL")
+_STORAGE_OPT  = typer.Option(".watchdiff", "--storage", "-s", help="Storage directory.",
+                              envvar="WATCHDIFF_STORAGE")
+_LIMIT_OPT    = typer.Option(20,  "--limit", "-n", help="Number of entries to show.")
+_VERBOSE_OPT  = typer.Option(False, "--verbose", "-v", help="Enable debug logging.",
+                              envvar="WATCHDIFF_VERBOSE")
 
 _CONFIG_FILE  = "watchdiff.config.json"
+_VALID_DIFF_MODES = {"line", "semantic", "word", "json"}
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "level":     record.levelname.lower(),
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "name":      record.name,
+            "message":   record.getMessage(),
+        })
+
+
+def _setup_logging(verbose: bool, log_format: str = "text") -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    if log_format == "json":
+        handler = logging.StreamHandler()
+        handler.setFormatter(_JsonFormatter())
+        logging.basicConfig(level=level, handlers=[handler], force=True)
+    else:
+        logging.basicConfig(
+            level   = level,
+            format  = "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+            datefmt = "%H:%M:%S",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+
+def _validate_config(data: dict[str, Any], path: Path) -> None:
+    errors: list[str] = []
+
+    watchers = data.get("watchers", [])
+    if not isinstance(watchers, list):
+        errors.append("'watchers' must be a list")
+        _exit_with_config_errors(errors, path)
+        return
+
+    for i, w in enumerate(watchers):
+        prefix = f"watchers[{i}]"
+
+        url = w.get("url", "")
+        if not str(url).startswith(("http://", "https://")):
+            errors.append(f"{prefix}.url: must start with http:// or https:// (got {url!r})")
+
+        diff_mode = w.get("diff_mode", "line")
+        if diff_mode not in _VALID_DIFF_MODES:
+            errors.append(
+                f"{prefix}.diff_mode: must be one of {', '.join(sorted(_VALID_DIFF_MODES))} "
+                f"(got {diff_mode!r})"
+            )
+
+        jitter = w.get("jitter", 0.0)
+        if isinstance(jitter, (int, float)) and not (0.0 <= float(jitter) <= 1.0):
+            errors.append(f"{prefix}.jitter: must be between 0.0 and 1.0 (got {jitter})")
+
+        change_threshold = w.get("change_threshold")
+        if change_threshold is not None and isinstance(change_threshold, (int, float)):
+            if not (0.0 <= float(change_threshold) <= 1.0):
+                errors.append(
+                    f"{prefix}.change_threshold: must be between 0.0 and 1.0 "
+                    f"(got {change_threshold})"
+                )
+
+        for field in (
+            "interval", "timeout", "retries", "cooldown",
+            "max_snapshots", "webhook_retries",
+        ):
+            val = w.get(field)
+            if val is not None and (not isinstance(val, (int, float)) or float(val) < 0):
+                errors.append(f"{prefix}.{field}: must be a non-negative number (got {val!r})")
+
+        for field in ("ignore_selectors", "ignore_patterns", "webhooks", "proxies", "user_agents"):
+            val = w.get(field)
+            if val is not None and not isinstance(val, list):
+                errors.append(f"{prefix}.{field}: must be a list (got {type(val).__name__})")
+
+        headers = w.get("headers")
+        if headers is not None and not isinstance(headers, dict):
+            errors.append(f"{prefix}.headers: must be an object (got {type(headers).__name__})")
+
+    if errors:
+        _exit_with_config_errors(errors, path)
+
+
+def _exit_with_config_errors(errors: list[str], path: Path) -> None:
+    console.print(f"[red]Config validation failed:[/] {path}")
+    for err in errors:
+        console.print(f"  [red]•[/] {err}")
+    raise typer.Exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +184,7 @@ def cmd_init(
                 "ignore_numbers":           False,
                 "alert_if_no_change_after": None,
                 "webhooks":                 [],
+                "webhook_retries":          3,
                 "proxies":                  [],
                 "user_agents":              [],
                 "ignore_selectors":         [],
@@ -95,7 +197,11 @@ def cmd_init(
 
     dest.write_text(json.dumps(template, indent=2, ensure_ascii=False), encoding="utf-8")
     console.print(f"[green]Created[/] {dest}")
-    console.print(f"Edit the file, then run: [bold cyan]watchdiff run --config {dest}[/]")
+    console.print(
+        "Edit the file, then run: [bold cyan]watchdiff run --config "
+        f"{dest}[/]\n"
+        "[dim]Config is validated on load - invalid fields are reported with clear messages.[/]"
+    )
 
 
 @app.command("run")
@@ -104,22 +210,46 @@ def cmd_run(
     target: str | None      = _TARGET_OPT,
     interval: int           = _INTERVAL_OPT,
     storage: str            = _STORAGE_OPT,
-    webhook: list[str]      = typer.Option([], "--webhook", "-w", help="Webhook URL (repeatable)."),
+    webhook: list[str]      = typer.Option([], "--webhook", "-w", help="Webhook URL (repeatable).",
+                                           envvar="WATCHDIFF_WEBHOOK"),
     verbose: bool           = _VERBOSE_OPT,
-    quiet: bool             = typer.Option(False, "--quiet", "-q", help="Suppress change output."),
-    diff_mode: str          = typer.Option("line", "--diff-mode", help="Diff mode: line | semantic | word | json."),
-    browser: bool           = typer.Option(False, "--browser", help="Use headless browser (Playwright)."),
-    cooldown: int           = typer.Option(0, "--cooldown", help="Min seconds between alerts (0 = off)."),
-    dry_run: bool           = typer.Option(False, "--dry-run", help="Fetch+diff without saving or alerting."),
-    retries: int            = typer.Option(0, "--retries", help="HTTP retry attempts on transient errors."),
-    jitter: float           = typer.Option(0.0, "--jitter", help="Interval jitter fraction 0.0-1.0."),
-    max_snapshots: int      = typer.Option(0, "--max-snapshots", help="Max snapshots to keep (0 = unlimited)."),
-    change_threshold: float = typer.Option(0.0, "--change-threshold", help="Min change ratio 0.0-1.0 (0 = off)."),
-    ignore_numbers: bool    = typer.Option(False, "--ignore-numbers", help="Strip digit tokens before diffing."),
-    config_file: str | None = typer.Option(None, "--config", "-c", help="Load watchers from a JSON config file."),
+    quiet: bool             = typer.Option(False, "--quiet", "-q", help="Suppress change output.",
+                                           envvar="WATCHDIFF_QUIET"),
+    log_format: str         = typer.Option("text", "--log-format",
+                                           help="Log format: text | json.",
+                                           envvar="WATCHDIFF_LOG_FORMAT"),
+    diff_mode: str          = typer.Option("line", "--diff-mode",
+                                           help="Diff mode: line | semantic | word | json.",
+                                           envvar="WATCHDIFF_DIFF_MODE"),
+    browser: bool           = typer.Option(False, "--browser",
+                                           help="Use headless browser (Playwright).",
+                                           envvar="WATCHDIFF_BROWSER"),
+    cooldown: int           = typer.Option(0, "--cooldown",
+                                           help="Min seconds between alerts (0 = off).",
+                                           envvar="WATCHDIFF_COOLDOWN"),
+    dry_run: bool           = typer.Option(False, "--dry-run",
+                                           help="Fetch+diff without saving or alerting.",
+                                           envvar="WATCHDIFF_DRY_RUN"),
+    retries: int            = typer.Option(0, "--retries",
+                                           help="HTTP retry attempts on transient errors.",
+                                           envvar="WATCHDIFF_RETRIES"),
+    jitter: float           = typer.Option(0.0, "--jitter",
+                                           help="Interval jitter fraction 0.0-1.0.",
+                                           envvar="WATCHDIFF_JITTER"),
+    max_snapshots: int      = typer.Option(0, "--max-snapshots",
+                                           help="Max snapshots to keep (0 = unlimited).",
+                                           envvar="WATCHDIFF_MAX_SNAPSHOTS"),
+    change_threshold: float = typer.Option(0.0, "--change-threshold",
+                                           help="Min change ratio 0.0-1.0 (0 = off).",
+                                           envvar="WATCHDIFF_CHANGE_THRESHOLD"),
+    ignore_numbers: bool    = typer.Option(False, "--ignore-numbers",
+                                           help="Strip digit tokens before diffing.",
+                                           envvar="WATCHDIFF_IGNORE_NUMBERS"),
+    config_file: str | None = typer.Option(None, "--config", "-c",
+                                           help="Load watchers from a JSON config file."),
 ) -> None:
     """Start continuous monitoring of a URL or a config file."""
-    _setup_logging(verbose)
+    _setup_logging(verbose, log_format)
 
     def _print_report(report: DiffReport) -> None:
         if not quiet:
@@ -181,17 +311,34 @@ def cmd_check(
     target: str | None      = _TARGET_OPT,
     storage: str            = _STORAGE_OPT,
     verbose: bool           = _VERBOSE_OPT,
+    log_format: str         = typer.Option("text", "--log-format",
+                                           help="Log format: text | json.",
+                                           envvar="WATCHDIFF_LOG_FORMAT"),
     output_json: bool       = typer.Option(False, "--json", help="Output raw JSON."),
-    diff_mode: str          = typer.Option("line", "--diff-mode", help="Diff mode: line | semantic | word | json."),
-    browser: bool           = typer.Option(False, "--browser", help="Use headless browser."),
-    cooldown: int           = typer.Option(0, "--cooldown", help="Min seconds between alerts (0 = off)."),
-    dry_run: bool           = typer.Option(False, "--dry-run", help="Fetch+diff without saving or alerting."),
-    retries: int            = typer.Option(0, "--retries", help="HTTP retry attempts on transient errors."),
-    ignore_numbers: bool    = typer.Option(False, "--ignore-numbers", help="Strip digit tokens before diffing."),
-    change_threshold: float = typer.Option(0.0, "--change-threshold", help="Min change ratio (0 = off)."),
+    diff_mode: str          = typer.Option("line", "--diff-mode",
+                                           help="Diff mode: line | semantic | word | json.",
+                                           envvar="WATCHDIFF_DIFF_MODE"),
+    browser: bool           = typer.Option(False, "--browser",
+                                           help="Use headless browser.",
+                                           envvar="WATCHDIFF_BROWSER"),
+    cooldown: int           = typer.Option(0, "--cooldown",
+                                           help="Min seconds between alerts (0 = off).",
+                                           envvar="WATCHDIFF_COOLDOWN"),
+    dry_run: bool           = typer.Option(False, "--dry-run",
+                                           help="Fetch+diff without saving or alerting.",
+                                           envvar="WATCHDIFF_DRY_RUN"),
+    retries: int            = typer.Option(0, "--retries",
+                                           help="HTTP retry attempts on transient errors.",
+                                           envvar="WATCHDIFF_RETRIES"),
+    ignore_numbers: bool    = typer.Option(False, "--ignore-numbers",
+                                           help="Strip digit tokens before diffing.",
+                                           envvar="WATCHDIFF_IGNORE_NUMBERS"),
+    change_threshold: float = typer.Option(0.0, "--change-threshold",
+                                           help="Min change ratio (0 = off).",
+                                           envvar="WATCHDIFF_CHANGE_THRESHOLD"),
 ) -> None:
     """Run a single check and print the result."""
-    _setup_logging(verbose)
+    _setup_logging(verbose, log_format)
 
     wd = WatchDiff(storage_dir=storage)
     wd.watch(
@@ -405,6 +552,8 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
         console.print(f"[red]Failed to read config:[/] {exc}")
         raise typer.Exit(1)
 
+    _validate_config(data, path)
+
     storage  = data.get("storage", ".watchdiff")
     watchers = data.get("watchers", [])
 
@@ -435,6 +584,7 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
             ignore_selectors         = w.get("ignore_selectors", []),
             ignore_patterns          = w.get("ignore_patterns", []),
             webhooks                 = w.get("webhooks", []),
+            webhook_retries          = w.get("webhook_retries", 3),
             diff_mode                = w.get("diff_mode", "line"),
             browser                  = w.get("browser", False),
             browser_options          = bo,
@@ -480,12 +630,3 @@ def _render_report(report: DiffReport) -> None:
             lines.append(f"  [yellow][~][/] {change.before} [dim]->[/] {change.after}")
 
     console.print(Panel("\n".join(lines), title="Changes detected", border_style="yellow"))
-
-
-def _setup_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level   = level,
-        format  = "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-        datefmt = "%H:%M:%S",
-    )

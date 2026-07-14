@@ -4,13 +4,19 @@ WatchDiff - unit tests.
 
 from __future__ import annotations
 
+import json
+from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from watchdiff.cleaner import Cleaner
 from watchdiff.diff import DiffEngine
-from watchdiff.models import ChangeType, Snapshot, WatchConfig
+from watchdiff.fetcher import FetchError, Fetcher
+from watchdiff.models import AlertConfig, ChangeType, Snapshot, WatchConfig
+from watchdiff.notifier import Notifier
 from watchdiff.parser import Parser
+from watchdiff.scheduler.scheduler import SyncScheduler
 from watchdiff.store import Store
 
 
@@ -161,3 +167,167 @@ class TestStore:
         store.save_snapshot(snap)
         store.clear_history("https://example.com", None)
         assert store.load_latest("https://example.com", None) is None
+
+
+# ---------------------------------------------------------------------------
+# Notifier
+# ---------------------------------------------------------------------------
+
+class TestNotifier:
+    def _make_report(self) -> object:
+        before = Snapshot(url="https://example.com", target=None, content="Hello", raw_html="")
+        after  = Snapshot(url="https://example.com", target=None, content="Hello World", raw_html="")
+        return DiffEngine().compare(before, after, WatchConfig(url="https://example.com", label="test"))
+
+    def test_skips_if_no_changes(self):
+        s      = Snapshot(url="https://example.com", target=None, content="Same", raw_html="")
+        report = DiffEngine().compare(s, s, WatchConfig(url="https://example.com", label="test"))
+        called = []
+        Notifier().notify(report, AlertConfig(on_change=[lambda r: called.append(r)]))
+        assert not called
+
+    def test_skips_if_below_min_changes(self):
+        report = self._make_report()
+        called = []
+        Notifier().notify(report, AlertConfig(on_change=[lambda r: called.append(r)], min_changes=99))
+        assert not called
+
+    def test_calls_on_change_callback(self):
+        report = self._make_report()
+        called = []
+        Notifier().notify(report, AlertConfig(on_change=[lambda r: called.append(r)]))
+        assert len(called) == 1
+
+    def test_callback_exception_does_not_raise(self):
+        report = self._make_report()
+        def bad_cb(r): raise ValueError("oops")
+        Notifier().notify(report, AlertConfig(on_change=[bad_cb]))  # must not raise
+
+    def test_sends_discord_webhook(self, httpx_mock):
+        httpx_mock.add_response(url="https://discord.com/api/webhooks/test", status_code=200)
+        report = self._make_report()
+        Notifier().notify(report, AlertConfig(
+            webhooks=["https://discord.com/api/webhooks/test"], webhook_retries=0
+        ))
+        payload = json.loads(httpx_mock.get_requests()[0].content)
+        assert "content" in payload
+
+    def test_sends_slack_webhook(self, httpx_mock):
+        httpx_mock.add_response(url="https://hooks.slack.com/services/test", status_code=200)
+        report = self._make_report()
+        Notifier().notify(report, AlertConfig(
+            webhooks=["https://hooks.slack.com/services/test"], webhook_retries=0
+        ))
+        payload = json.loads(httpx_mock.get_requests()[0].content)
+        assert "text" in payload
+
+    def test_sends_generic_webhook(self, httpx_mock):
+        httpx_mock.add_response(url="https://my-server.example.com/hook", status_code=200)
+        report = self._make_report()
+        Notifier().notify(report, AlertConfig(
+            webhooks=["https://my-server.example.com/hook"], webhook_retries=0
+        ))
+        payload = json.loads(httpx_mock.get_requests()[0].content)
+        assert "url" in payload and "changes" in payload
+
+    def test_webhook_retry_on_server_error(self, httpx_mock):
+        httpx_mock.add_response(url="https://discord.com/api/webhooks/test", status_code=500)
+        httpx_mock.add_response(url="https://discord.com/api/webhooks/test", status_code=200)
+        report = self._make_report()
+        with patch("watchdiff.notifier.notifier.time.sleep"):
+            Notifier().notify(report, AlertConfig(
+                webhooks=["https://discord.com/api/webhooks/test"], webhook_retries=1
+            ))
+        assert len(httpx_mock.get_requests()) == 2
+
+    def test_webhook_logs_warning_after_all_retries_fail(self, httpx_mock):
+        httpx_mock.add_response(url="https://discord.com/api/webhooks/test", status_code=500)
+        report = self._make_report()
+        # webhook_retries=0 → 1 attempt max, should not raise
+        Notifier().notify(report, AlertConfig(
+            webhooks=["https://discord.com/api/webhooks/test"], webhook_retries=0
+        ))
+        assert len(httpx_mock.get_requests()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Fetcher
+# ---------------------------------------------------------------------------
+
+class TestFetcher:
+    def _config(self, **kwargs) -> WatchConfig:
+        return WatchConfig(url="https://example.com", **kwargs)
+
+    def test_returns_html_on_200(self, httpx_mock):
+        httpx_mock.add_response(url="https://example.com", status_code=200, text="<html>Hello</html>")
+        result = Fetcher().fetch(self._config())
+        assert "Hello" in result
+
+    def test_raises_fetch_error_on_404(self, httpx_mock):
+        httpx_mock.add_response(url="https://example.com", status_code=404)
+        with pytest.raises(FetchError):
+            Fetcher().fetch(self._config())
+
+    def test_raises_fetch_error_on_connection_error(self, httpx_mock):
+        httpx_mock.add_exception(httpx.ConnectError("connection failed"))
+        with pytest.raises(FetchError):
+            Fetcher().fetch(self._config())
+
+    def test_sends_custom_headers(self, httpx_mock):
+        httpx_mock.add_response(url="https://example.com", status_code=200, text="ok")
+        Fetcher().fetch(self._config(headers={"X-Custom": "test-value"}))
+        assert httpx_mock.get_requests()[0].headers.get("x-custom") == "test-value"
+
+    def test_retries_on_503(self, httpx_mock):
+        httpx_mock.add_response(url="https://example.com", status_code=503)
+        httpx_mock.add_response(url="https://example.com", status_code=200, text="ok")
+        with patch("watchdiff.fetcher.fetcher.time.sleep"):
+            result = Fetcher().fetch(self._config(retries=1, retry_delay=0.0))
+        assert result == "ok"
+        assert len(httpx_mock.get_requests()) == 2
+
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+class TestScheduler:
+    def _config(self, **kwargs) -> WatchConfig:
+        return WatchConfig(url="https://example.com", label="test", **kwargs)
+
+    def _mock_store(self, previous: Snapshot | None = None) -> MagicMock:
+        store = MagicMock()
+        store.load_latest.return_value = previous
+        return store
+
+    def test_first_check_returns_none_and_saves_snapshot(self, httpx_mock):
+        httpx_mock.add_response(url="https://example.com", status_code=200, text="<html><body>Hello</body></html>")
+        store     = self._mock_store()
+        scheduler = SyncScheduler(store)
+        result    = scheduler.check_once(self._config())
+        assert result is None
+        store.save_snapshot.assert_called_once()
+
+    def test_detects_changes_between_snapshots(self, httpx_mock):
+        httpx_mock.add_response(url="https://example.com", status_code=200, text="<html><body>Hello World</body></html>")
+        previous  = Snapshot(url="https://example.com", target=None, content="Hello", raw_html="")
+        store     = self._mock_store(previous=previous)
+        scheduler = SyncScheduler(store)
+        report    = scheduler.check_once(self._config())
+        assert report is not None
+        assert report.has_changes
+
+    def test_pause_and_resume_updates_state(self):
+        scheduler = SyncScheduler(MagicMock())
+        scheduler.pause("https://example.com")
+        assert "https://example.com" in scheduler._paused
+        scheduler.resume("https://example.com")
+        assert "https://example.com" not in scheduler._paused
+
+    def test_status_returns_entry_per_config(self):
+        scheduler         = SyncScheduler(MagicMock())
+        scheduler._configs = [self._config()]
+        statuses          = scheduler.status()
+        assert len(statuses) == 1
+        assert statuses[0].url == "https://example.com"
+        assert not statuses[0].paused

@@ -92,6 +92,7 @@ class WatchDiff:
         on_change: Callable[[DiffReport], None] | list[Callable[[DiffReport], None]] | None  = None,
         webhooks: list[str] | None                                                            = None,
         min_changes: int                                                                      = 1,
+        webhook_retries: int                                                                  = 3,
         diff_mode: str                                                                        = "line",
         browser: bool                                                                         = False,
         browser_options: BrowserOptions | None                                                = None,
@@ -153,9 +154,10 @@ class WatchDiff:
             callbacks = on_change if isinstance(on_change, list) else [on_change]
 
         alert = AlertConfig(
-            on_change   = callbacks,
-            webhooks    = webhooks or [],
-            min_changes = min_changes,
+            on_change       = callbacks,
+            webhooks        = webhooks or [],
+            min_changes     = min_changes,
+            webhook_retries = webhook_retries,
         ) if (callbacks or webhooks) else None
 
         config = WatchConfig(

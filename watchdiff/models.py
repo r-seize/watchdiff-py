@@ -86,6 +86,7 @@ class AlertConfig:
     on_change: list[Callable[[DiffReport], Any]] = field(default_factory=list)
     webhooks: list[str]    = field(default_factory=list)
     min_changes: int       = 1
+    webhook_retries: int   = 3  # retry attempts for failed webhook deliveries (0 = no retry)
 
 
 # ---------------------------------------------------------------------------
