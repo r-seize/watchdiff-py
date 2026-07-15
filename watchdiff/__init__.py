@@ -1,6 +1,7 @@
 from watchdiff.core import WatchDiff
 from watchdiff.exporter import Exporter
-from watchdiff.models import BrowserOptions, DiffMode, WatchConfig
+from watchdiff.models import BrowserOptions, DiffMode, SpikeInfo, WatchConfig
+from watchdiff.status_server import StatusServer
 from watchdiff.store import SqliteStore, Store
 
 __all__ = [
@@ -8,6 +9,8 @@ __all__ = [
     "DiffMode",
     "Exporter",
     "SqliteStore",
+    "SpikeInfo",
+    "StatusServer",
     "Store",
     "WatchConfig",
     "WatchDiff",

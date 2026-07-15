@@ -41,6 +41,7 @@ from watchdiff.models import (
     BrowserOptions,
     DiffReport,
     SilenceInfo,
+    SpikeInfo,
     WatchConfig,
     WatcherStatus,
 )
@@ -68,11 +69,12 @@ class WatchDiff:
             store:       Custom store instance - Store, SqliteStore, or any compatible object.
                          When provided, storage_dir is ignored.
         """
-        self._store: Any                                          = store if store is not None else Store(storage_dir)
-        self._configs: list[WatchConfig]                          = []
+        self._store: Any                                           = store if store is not None else Store(storage_dir)
+        self._configs: list[WatchConfig]                           = []
         self._global_callbacks: list[Callable[[DiffReport], None]] = []
-        self._scheduler: SyncScheduler | None                     = None
-        self._async_scheduler: AsyncScheduler | None              = None
+        self._scheduler: SyncScheduler | None                      = None
+        self._async_scheduler: AsyncScheduler | None               = None
+        self._status_server: Any | None                            = None
 
     # ------------------------------------------------------------------
     # Configuration API
@@ -109,6 +111,11 @@ class WatchDiff:
         alert_if_no_change_after: int | None                                                  = None,
         on_error: Callable[[Exception, WatchConfig], None] | None                             = None,
         on_silence: Callable[[SilenceInfo], None] | None                                      = None,
+        archive_html: bool                                                                     = False,
+        screenshot_on_change: bool                                                             = False,
+        change_spike_window: int | None                                                        = None,
+        change_spike_threshold: int | None                                                     = None,
+        on_spike: Callable[[SpikeInfo], None] | None                                          = None,
     ) -> WatchDiff:
         """
         Register a URL to monitor.
@@ -126,7 +133,7 @@ class WatchDiff:
             on_change:                Callback(s) called with a DiffReport on each change.
             webhooks:                 Webhook URLs (Discord/Slack/Telegram/etc.) to POST on change.
             min_changes:              Alert only if at least N changes are detected.
-            diff_mode:                "line" | "semantic" | "word" | "json".
+            diff_mode:                "line" | "semantic" | "word" | "json" | "rss".
             browser:                  Use Playwright headless browser instead of httpx.
                                       Requires: pip install "watchdiff-core[browser]"
             browser_options:          BrowserOptions for fine-tuning Playwright behaviour.
@@ -186,6 +193,11 @@ class WatchDiff:
             alert_if_no_change_after = alert_if_no_change_after,
             on_error                 = on_error,
             on_silence               = on_silence,
+            archive_html             = archive_html,
+            screenshot_on_change     = screenshot_on_change,
+            change_spike_window      = change_spike_window,
+            change_spike_threshold   = change_spike_threshold,
+            on_spike                 = on_spike,
         )
         self._configs.append(config)
         return self
@@ -399,6 +411,115 @@ class WatchDiff:
         """
         from watchdiff.exporter import Exporter  # noqa: PLC0415
         return Exporter(self._store).reports_xlsx(url, target, limit=limit, dest=dest)
+
+    # ------------------------------------------------------------------
+    # Status server
+    # ------------------------------------------------------------------
+
+    def start_status_server(self, port: int = 9090, host: str = "0.0.0.0") -> None:
+        """
+        Start the embedded HTTP status server.
+
+        Endpoints: GET /health · GET /status · GET /metrics (Prometheus).
+
+        Args:
+            port: TCP port to bind (default 9090).
+            host: Bind address (default "0.0.0.0").
+        """
+        from watchdiff.status_server import StatusServer  # noqa: PLC0415
+
+        def _get_statuses() -> list[WatcherStatus]:
+            return self.status()
+
+        server = StatusServer(get_statuses=_get_statuses, host=host, port=port)
+        server.start()
+        self._status_server = server
+
+    def stop_status_server(self) -> None:
+        """Stop the embedded HTTP status server."""
+        if self._status_server:
+            self._status_server.stop()
+            self._status_server = None
+
+    # ------------------------------------------------------------------
+    # URL comparison
+    # ------------------------------------------------------------------
+
+    def compare_urls(
+        self,
+        url_a: str,
+        url_b: str,
+        *,
+        target: str | None              = None,
+        diff_mode: str                  = "line",
+        browser: bool                   = False,
+        timeout: int                    = 15,
+        headers: dict | None            = None,
+        ignore_selectors: list[str] | None = None,
+        ignore_patterns: list[str] | None  = None,
+        proxies: list[str] | None          = None,
+        user_agents: list[str] | None      = None,
+    ) -> DiffReport:
+        """
+        Fetch two different URLs and compare their content immediately.
+
+        Args:
+            url_a:            First URL (treated as "before").
+            url_b:            Second URL (treated as "after").
+            target:           CSS selector or XPath to narrow comparison.
+            diff_mode:        "line" | "semantic" | "word" | "json" | "rss".
+            browser:          Use headless browser (Playwright).
+            timeout:          HTTP request timeout in seconds.
+            headers:          Extra HTTP headers.
+            ignore_selectors: CSS selectors to strip before diffing.
+            ignore_patterns:  Regex patterns to strip from text before diffing.
+            proxies:          Proxy URLs — one picked randomly per request.
+            user_agents:      User-Agent strings — one picked randomly per request.
+
+        Returns:
+            DiffReport comparing the two pages.
+        """
+        from watchdiff.cleaner import Cleaner  # noqa: PLC0415
+        from watchdiff.diff import DiffEngine  # noqa: PLC0415
+        from watchdiff.fetcher import Fetcher  # noqa: PLC0415
+        from watchdiff.parser import Parser    # noqa: PLC0415
+
+        shared = dict(
+            target           = target,
+            diff_mode        = diff_mode,
+            browser          = browser,
+            timeout          = timeout,
+            headers          = headers or {},
+            ignore_selectors = ignore_selectors or [],
+            ignore_patterns  = ignore_patterns or [],
+            proxies          = proxies or [],
+            user_agents      = user_agents or [],
+        )
+        cfg_a = WatchConfig(url=url_a, **shared)
+        cfg_b = WatchConfig(url=url_b, **shared)
+
+        if browser:
+            from watchdiff.fetcher.browser import BrowserFetcher  # noqa: PLC0415
+            fetcher_fn = BrowserFetcher().fetch
+        else:
+            _fetcher = Fetcher()
+            fetcher_fn = _fetcher.fetch
+
+        cleaner = Cleaner()
+        parser  = Parser()
+        engine  = DiffEngine()
+
+        html_a   = fetcher_fn(cfg_a)
+        soup_a   = cleaner.clean(html_a)
+        snap_a   = parser.extract(soup_a, cfg_a)
+
+        html_b   = fetcher_fn(cfg_b)
+        soup_b   = cleaner.clean(html_b)
+        snap_b   = parser.extract(soup_b, cfg_b)
+
+        cfg_cmp  = WatchConfig(url=url_a, target=target, diff_mode=diff_mode,
+                               label=f"{url_a} vs {url_b}")
+        return engine.compare(snap_a, snap_b, cfg_cmp)
 
     # ------------------------------------------------------------------
     # Internal

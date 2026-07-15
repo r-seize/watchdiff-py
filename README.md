@@ -23,12 +23,18 @@ No noisy HTML diffs. No external services. No AI black boxes.
 | Retry on failure | `retries=3, retry_delay=1.0` |
 | Diff at word or paragraph level | `diff_mode="word"` or `diff_mode="semantic"` |
 | Diff a JSON endpoint | `diff_mode="json"` |
+| Monitor an RSS/Atom feed | `diff_mode="rss"` |
 | Skip number-only changes | `ignore_numbers=True` |
 | Test without saving | `dry_run=True` |
 | Alert if a page stops changing | `alert_if_no_change_after=86400` |
 | Limit stored history | `max_snapshots=50` |
 | Pause / resume a watcher | `.pause(url)` / `.resume(url)` |
 | Live watcher status | `.status()` |
+| HTTP status API + Prometheus | `.start_status_server(port=9090)` |
+| Archive HTML on change | `archive_html=True` |
+| Screenshot on change | `screenshot_on_change=True, browser=True` |
+| Detect change spikes | `change_spike_window=60, change_spike_threshold=5` |
+| Compare two different URLs | `.compare_urls(url_a, url_b)` / `watchdiff compare <urlA> <urlB>` |
 | Persist to SQLite | `WatchDiff(store=SqliteStore(".watchdiff.db"))` |
 | Export history | `.export_reports_csv(url)` / `.export_reports_xlsx(url)` |
 | CLI one-liner | `watchdiff run https://example.com --target .price --interval 60` |
@@ -41,6 +47,7 @@ No noisy HTML diffs. No external services. No AI black boxes.
 - [Quick start](#quick-start)
 - [Features](#features)
   - [Diff modes](#diff-modes)
+  - [RSS / Atom feeds](#rss--atom-feeds)
   - [JS-heavy pages (Playwright)](#javascript-pages-with-playwright)
   - [Proxy and User-Agent rotation](#proxy-rotation-and-user-agent-rotation)
   - [Retry and backoff](#retry-and-backoff)
@@ -55,6 +62,11 @@ No noisy HTML diffs. No external services. No AI black boxes.
   - [Error callback](#error-callback)
   - [Pause and resume](#pause-and-resume)
   - [Live status](#live-status)
+  - [HTTP status server](#http-status-server)
+  - [HTML archiving](#html-archiving)
+  - [Screenshot on change](#screenshot-on-change)
+  - [Change spike detection](#change-spike-detection)
+  - [URL comparison](#url-comparison)
   - [XPath selectors](#xpath-selectors)
   - [SQLite storage backend](#sqlite-storage-backend)
   - [CSV and XLSX export](#csv-and-xlsx-export)
@@ -135,8 +147,14 @@ watchdiff check https://example.com --target .price
 # Compare last two snapshots
 watchdiff diff https://example.com --target .price
 
+# Compare two different URLs
+watchdiff compare https://example.com/v1 https://example.com/v2
+
 # Continuous monitoring (Ctrl+C to stop)
 watchdiff run https://example.com --target .price --interval 60
+
+# With status server on port 9090
+watchdiff run https://example.com --interval 60 --status-port 9090
 
 # Show status from config file
 watchdiff status
@@ -153,7 +171,7 @@ watchdiff clear https://example.com
 
 ### Diff modes
 
-WatchDiff supports four diff strategies, set with `diff_mode`:
+WatchDiff supports five diff strategies, set with `diff_mode`:
 
 | Mode | Description | Best for |
 |---|---|---|
@@ -161,11 +179,13 @@ WatchDiff supports four diff strategies, set with `diff_mode`:
 | `"semantic"` | Block-level diff on `<p>`, `<h1>`–`<h6>`, `<li>`, `<td>`, `<th>`, `<blockquote>` | Articles, blogs |
 | `"word"` | Word-level diff, coalesces replaced words into a single `modified` change | Short text, prices |
 | `"json"` | Recursive key-path diff (`price`, `stock.available`); falls back to line if not valid JSON | JSON API endpoints |
+| `"rss"` | Item-level diff for RSS 2.0 / Atom feeds (by `guid`/`id`); falls back to line | News feeds, podcasts |
 
 ```python
 wd.watch("https://example.com/api/product/1", diff_mode="json")
 wd.watch("https://blog.example.com/article",  diff_mode="semantic")
 wd.watch("https://example.com/product",       diff_mode="word")
+wd.watch("https://news.example.com/feed.xml", diff_mode="rss")
 ```
 
 **JSON diff example** — instead of reporting the raw changed line, WatchDiff reports the exact key path:
@@ -181,6 +201,29 @@ In the CLI:
 ```bash
 watchdiff run   https://example.com/api/product --diff-mode json
 watchdiff check https://example.com/api/product --diff-mode json
+```
+
+### RSS / Atom feeds
+
+Monitor news feeds, podcast feeds, or any syndication format. WatchDiff diffs at the item level — each new, removed, or renamed entry is reported individually:
+
+```python
+wd.watch(
+    "https://hnrss.org/frontpage",
+    diff_mode="rss",
+    interval=300,
+    on_change=lambda r: print(r.summary()),
+)
+```
+
+**Supported formats:**
+- RSS 2.0 — keyed by `<guid>` (falls back to `<link>` then `<title>`)
+- Atom — keyed by `<id>` (falls back to `<link href>` then `<title>`)
+
+Uses Python stdlib `xml.etree.ElementTree` — zero extra dependencies.
+
+```bash
+watchdiff run https://hnrss.org/frontpage --diff-mode rss --interval 300
 ```
 
 ### JavaScript pages with Playwright
@@ -456,7 +499,7 @@ wd.start(block=False)
 
 statuses = wd.status()
 for s in statuses:
-    print(s.url, s.checks_count, s.changes_count, s.last_check_at, s.paused)
+    print(s.url, s.checks_count, s.changes_count, s.errors_count, s.paused)
 ```
 
 `WatcherStatus` fields:
@@ -473,8 +516,143 @@ for s in statuses:
 | `last_change_at` | `datetime \| None` | Time the last change was detected |
 | `checks_count` | `int` | Total checks since start |
 | `changes_count` | `int` | Total changes detected since start |
+| `errors_count` | `int` | Total fetch/parse errors since start |
 
 Returns an empty list if `.start()` has not been called yet.
+
+### HTTP status server
+
+Start an embedded HTTP server to expose live watcher state and Prometheus metrics. Uses Python stdlib `http.server` — zero extra dependencies.
+
+```python
+wd.watch("https://example.com", interval=60)
+wd.start(block=False)
+wd.start_status_server(port=9090)
+```
+
+**Endpoints:**
+
+| Endpoint | Description |
+|---|---|
+| `GET /health` | Returns `{"status": "ok"}` — suitable for load-balancer health checks |
+| `GET /status` | JSON array of `WatcherStatus` for all registered watchers |
+| `GET /metrics` | Prometheus text format (scrape with Grafana, Prometheus, etc.) |
+
+**Prometheus metrics exposed per watcher (`url` + `label` labels):**
+
+```
+watchdiff_checks_total{url="...",label="..."} 42
+watchdiff_changes_total{url="...",label="..."} 3
+watchdiff_errors_total{url="...",label="..."} 0
+watchdiff_paused{url="...",label="..."} 0
+watchdiff_interval_seconds{url="...",label="..."} 300
+watchdiff_last_check_timestamp{url="...",label="..."} 1720000000.0
+watchdiff_last_change_timestamp{url="...",label="..."} 1719999000.0
+```
+
+```bash
+watchdiff run https://example.com --interval 60 --status-port 9090
+# Status API: http://localhost:9090/status
+# Metrics:    http://localhost:9090/metrics
+```
+
+To stop the server programmatically:
+
+```python
+wd.stop_status_server()
+```
+
+### HTML archiving
+
+Save the full raw HTML to disk every time a change is detected. Files are stored in `<storage>/.watchdiff/archive/` with a timestamped filename.
+
+```python
+wd.watch(
+    "https://example.com",
+    archive_html=True,
+)
+```
+
+File naming: `<url_md5_8chars>_<YYYYMMDDTHHMMSS>.html`
+
+Archiving is skipped in `dry_run` mode. Works with both `browser=True` and regular HTTP fetching.
+
+```bash
+watchdiff run https://example.com --archive-html
+```
+
+### Screenshot on change
+
+Capture a full-page PNG screenshot whenever a change is detected. Requires `browser=True` (Playwright).
+
+```bash
+pip install "watchdiff-core[browser]"
+playwright install chromium
+```
+
+```python
+wd.watch(
+    "https://example.com/dashboard",
+    browser=True,
+    screenshot_on_change=True,
+)
+```
+
+Screenshots are saved next to HTML archives in `<storage>/.watchdiff/archive/` with the same timestamp: `<url_md5_8chars>_<YYYYMMDDTHHMMSS>.png`
+
+```bash
+watchdiff run https://example.com --browser --screenshot
+```
+
+### Change spike detection
+
+Fire a callback when too many changes happen in a short time window — useful to detect page instability, bot mitigation resets, or CDN cache thrashing.
+
+```python
+from watchdiff.models import SpikeInfo
+
+def on_spike(info: SpikeInfo) -> None:
+    print(f"[SPIKE] {info.label}: {info.changes_in_window} changes in {info.window_seconds}s")
+
+wd.watch(
+    "https://example.com",
+    change_spike_window=60,     # rolling window in seconds
+    change_spike_threshold=5,   # alert if 5+ changes detected in window
+    on_spike=on_spike,
+)
+```
+
+`SpikeInfo` fields: `url`, `label`, `changes_in_window`, `window_seconds`.
+
+The spike alert fires at most once per window to avoid repeated callbacks.
+
+```bash
+watchdiff run https://example.com --spike-window 60 --spike-threshold 5
+```
+
+### URL comparison
+
+Fetch two different URLs and compare their content in one shot — without setting up a watcher or storing snapshots.
+
+```python
+wd = WatchDiff()
+report = wd.compare_urls(
+    "https://example.com/v1/api",
+    "https://example.com/v2/api",
+    diff_mode="json",
+)
+print(report.summary())
+for change in report.changes:
+    print(change.human())
+```
+
+From the CLI:
+
+```bash
+watchdiff compare https://example.com/v1 https://example.com/v2
+watchdiff compare https://staging.example.com https://example.com --diff-mode semantic
+watchdiff compare https://a.example.com https://b.example.com --json
+```
 
 ### XPath selectors
 
@@ -567,10 +745,10 @@ Edit `watchdiff.config.json`:
       "headers": {}
     },
     {
-      "url": "https://api.example.com/prices",
-      "interval": 60,
-      "label": "Prices API",
-      "diff_mode": "json",
+      "url": "https://hnrss.org/frontpage",
+      "interval": 300,
+      "label": "Hacker News",
+      "diff_mode": "rss",
       "webhooks": ["https://ntfy.sh/my-alerts"]
     }
   ]
@@ -622,7 +800,7 @@ Register a URL to monitor. All keyword arguments are optional. Returns `self` (c
 | `webhooks` | `list[str]` | `[]` | Webhook URLs to POST on change |
 | `min_changes` | `int` | `1` | Minimum number of changes to trigger alert |
 | `webhook_retries` | `int` | `3` | Retry attempts for failed webhook deliveries (0 = no retry) |
-| `diff_mode` | `str` | `"line"` | `"line"` \| `"semantic"` \| `"word"` \| `"json"` |
+| `diff_mode` | `str` | `"line"` | `"line"` \| `"semantic"` \| `"word"` \| `"json"` \| `"rss"` |
 | `browser` | `bool` | `False` | Use Playwright headless browser |
 | `browser_options` | `BrowserOptions \| None` | `None` | Fine-tune Playwright behaviour |
 | `proxies` | `list[str]` | `[]` | Proxy URLs — one picked randomly per request |
@@ -638,6 +816,11 @@ Register a URL to monitor. All keyword arguments are optional. Returns `self` (c
 | `alert_if_no_change_after` | `int \| None` | `None` | Fire `on_silence` if no change for N seconds |
 | `on_error` | `Callable \| None` | `None` | Called with `(exc, config)` when fetch fails |
 | `on_silence` | `Callable \| None` | `None` | Called with `SilenceInfo` when silence threshold hit |
+| `archive_html` | `bool` | `False` | Save full HTML to disk on every change |
+| `screenshot_on_change` | `bool` | `False` | Save PNG screenshot on change (requires `browser=True`) |
+| `change_spike_window` | `int \| None` | `None` | Spike detection rolling window in seconds |
+| `change_spike_threshold` | `int \| None` | `None` | Alert when this many changes occur in the window |
+| `on_spike` | `Callable \| None` | `None` | Called with `SpikeInfo` when spike is detected |
 
 ```python
 # Chainable
@@ -688,6 +871,43 @@ if report:
     print(report.summary())
 ```
 
+#### `.compare_urls(url_a, url_b, *, ...)`
+
+Fetch two different URLs and compare them immediately. Does not store snapshots.
+
+```python
+report = wd.compare_urls(
+    "https://example.com/v1",
+    "https://example.com/v2",
+    diff_mode="json",
+    target=".content",
+    browser=False,
+    timeout=15,
+)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `url_a` | `str` | — | First URL (treated as "before") |
+| `url_b` | `str` | — | Second URL (treated as "after") |
+| `target` | `str \| None` | `None` | CSS selector or XPath |
+| `diff_mode` | `str` | `"line"` | Diff strategy |
+| `browser` | `bool` | `False` | Use Playwright |
+| `timeout` | `int` | `15` | HTTP timeout in seconds |
+| `headers` | `dict \| None` | `None` | Extra HTTP headers |
+
+#### `.start_status_server(port, host)` / `.stop_status_server()`
+
+Start or stop the embedded HTTP status server:
+
+```python
+wd.start(block=False)
+wd.start_status_server(port=9090)        # binds to 0.0.0.0:9090
+wd.start_status_server(port=9090, host="127.0.0.1")
+
+wd.stop_status_server()
+```
+
 #### `.pause(url)` / `.resume(url)` / `.status()`
 
 Control watchers and inspect their state after `start(block=False)`:
@@ -697,7 +917,7 @@ wd.start(block=False)
 wd.pause("https://example.com")
 wd.resume("https://example.com")
 for s in wd.status():
-    print(s.label, s.checks_count, s.changes_count, s.paused)
+    print(s.label, s.checks_count, s.changes_count, s.errors_count, s.paused)
 ```
 
 #### `.history(url)` / `.reports(url)` / `.clear(url)`
@@ -737,12 +957,32 @@ change.human()  # "[~] Changed: '$19.00' - '$24.00'"
 str(change)     # same as .human()
 ```
 
+### `SpikeInfo`
+
+```python
+info.url               # str
+info.label             # str
+info.changes_in_window # int — number of changes detected in the window
+info.window_seconds    # int — the configured window size
+```
+
+### `StatusServer`
+
+```python
+from watchdiff import StatusServer
+
+server = StatusServer(get_statuses=wd.status, port=9090)
+server.start()
+server.stop()
+```
+
 ## CLI reference
 
 ```
 Commands:
   init      Generate a watchdiff.config.json template
   run       Start continuous monitoring (URL or config file)
+  compare   Fetch two URLs and compare their content
   check     Run a single check and print the result
   diff      Compare the last two stored snapshots for a URL
   status    Show snapshot state for all watchers in a config file
@@ -755,7 +995,7 @@ Options for run:
   --interval         -i   Seconds between checks (default 300)
   --storage          -s   Storage directory (default .watchdiff)
   --config           -c   Path to watchdiff.config.json
-  --diff-mode             line | semantic | word | json (default line)
+  --diff-mode             line | semantic | word | json | rss (default line)
   --browser               Use headless browser (requires playwright)
   --cooldown              Min seconds between alerts (0 = off)
   --dry-run               Fetch+diff without saving or alerting
@@ -764,10 +1004,23 @@ Options for run:
   --max-snapshots         Max snapshots to keep (0 = unlimited)
   --change-threshold      Min change ratio 0.0–1.0 (0 = off)
   --ignore-numbers        Strip digit tokens before diffing
+  --archive-html          Save full HTML to disk on every change
+  --screenshot            Save PNG screenshot on change (requires --browser)
+  --spike-window          Spike detection rolling window in seconds (0 = off)
+  --spike-threshold       Number of changes to trigger a spike alert
+  --status-port           Start HTTP status server on this port (0 = off)
   --webhook          -w   Webhook URL (repeatable)
   --log-format            Log format: text | json (default text)
   --verbose          -v   Enable debug logging
   --quiet            -q   Suppress change output
+
+Options for compare:
+  --target           -t   CSS selector or XPath
+  --diff-mode             Diff strategy (default line)
+  --browser               Use headless browser
+  --timeout               HTTP timeout in seconds (default 15)
+  --json                  Output raw JSON
+  --verbose          -v   Enable debug logging
 
 Options for check:
   same as run, plus:
@@ -808,6 +1061,11 @@ Every CLI option can be set via environment variable — useful for Docker, CI, 
 | `WATCHDIFF_MAX_SNAPSHOTS` | `--max-snapshots` | `100` |
 | `WATCHDIFF_CHANGE_THRESHOLD` | `--change-threshold` | `0.05` |
 | `WATCHDIFF_IGNORE_NUMBERS` | `--ignore-numbers` | `true` |
+| `WATCHDIFF_ARCHIVE_HTML` | `--archive-html` | `true` |
+| `WATCHDIFF_SCREENSHOT` | `--screenshot` | `true` |
+| `WATCHDIFF_SPIKE_WINDOW` | `--spike-window` | `60` |
+| `WATCHDIFF_SPIKE_THRESHOLD` | `--spike-threshold` | `5` |
+| `WATCHDIFF_STATUS_PORT` | `--status-port` | `9090` |
 | `WATCHDIFF_LOG_FORMAT` | `--log-format` | `json` |
 | `WATCHDIFF_VERBOSE` | `--verbose` | `true` |
 
@@ -815,6 +1073,7 @@ Every CLI option can be set via environment variable — useful for Docker, CI, 
 # Docker example
 ENV WATCHDIFF_STORAGE=/data/.watchdiff
 ENV WATCHDIFF_LOG_FORMAT=json
+ENV WATCHDIFF_STATUS_PORT=9090
 CMD ["watchdiff", "run", "--config", "/app/watchdiff.config.json"]
 ```
 
@@ -822,11 +1081,14 @@ CMD ["watchdiff", "run", "--config", "/app/watchdiff.config.json"]
 
 - **E-commerce** — track product prices, stock levels, and shipping estimates
 - **News monitoring** — detect article updates or new publications on a live feed
+- **RSS feeds** — get item-level alerts on new or changed entries with `diff_mode="rss"`
 - **API monitoring** — watch JSON endpoints for schema or value changes with `diff_mode="json"`
 - **Documentation** — alert when API docs, changelogs, or terms of service change
 - **SPA / React apps** — monitor JS-rendered content with `browser=True`
 - **Silence detection** — get alerted when a live dashboard or feed stops updating
-- **Compliance** — audit changes on public-facing pages over time
+- **Spike detection** — detect abnormal change rates (CDN issues, A/B tests, cache misses)
+- **Compliance** — audit changes on public-facing pages over time, archive HTML evidence
+- **Observability** — expose watcher metrics to Prometheus / Grafana via `/metrics`
 - **Research** — collect snapshots for longitudinal content analysis
 
 ## Contributing

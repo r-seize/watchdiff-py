@@ -28,6 +28,7 @@ class DiffMode(str, Enum):
     SEMANTIC = "semantic"  # block-level diff on <p>, <h1-h6>, <li>, <td>, <th>, <blockquote>
     WORD     = "word"      # word-by-word diff, coalescence removed+added -> modified
     JSON     = "json"      # recursive key-path diff, fallback line if not valid JSON
+    RSS      = "rss"       # item-level diff for RSS 2.0 / Atom feeds (by guid/id)
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,12 @@ class WatchConfig:
     alert_if_no_change_after: int | None = None # fire on_silence if no change for N seconds
     on_error: Callable[[Exception, WatchConfig], None] | None = None
     on_silence: Callable[[SilenceInfo], None] | None = None
+    # --- new in 0.1.5 ---
+    archive_html: bool                     = False    # save full HTML to disk on every change
+    screenshot_on_change: bool             = False    # save PNG screenshot on change (browser=True required)
+    change_spike_window: int | None        = None     # spike detection window in seconds
+    change_spike_threshold: int | None     = None     # alert when this many changes in window
+    on_spike: Callable[[SpikeInfo], None] | None = None
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -214,22 +221,26 @@ class WatcherStatus:
     last_change_at: datetime | None
     checks_count: int
     changes_count: int
+    errors_count: int       = 0
+    last_status_code: int   = 0   # 0 = unknown, 200 = ok
 
     def as_dict(self) -> dict:
         def _iso(dt: datetime | None) -> str | None:
             return dt.isoformat() if dt else None
 
         return {
-            "url":            self.url,
-            "label":          self.label,
-            "target":         self.target,
-            "interval":       self.interval,
-            "paused":         self.paused,
-            "last_check_at":  _iso(self.last_check_at),
-            "next_check_at":  _iso(self.next_check_at),
-            "last_change_at": _iso(self.last_change_at),
-            "checks_count":   self.checks_count,
-            "changes_count":  self.changes_count,
+            "url":              self.url,
+            "label":            self.label,
+            "target":           self.target,
+            "interval":         self.interval,
+            "paused":           self.paused,
+            "last_check_at":    _iso(self.last_check_at),
+            "next_check_at":    _iso(self.next_check_at),
+            "last_change_at":   _iso(self.last_change_at),
+            "checks_count":     self.checks_count,
+            "changes_count":    self.changes_count,
+            "errors_count":     self.errors_count,
+            "last_status_code": self.last_status_code,
         }
 
 
@@ -240,3 +251,13 @@ class SilenceInfo:
     url: str
     label: str
     seconds_since_last_change: float
+
+
+@dataclass
+class SpikeInfo:
+    """Payload passed to the on_spike callback."""
+
+    url: str
+    label: str
+    changes_in_window: int
+    window_seconds: int

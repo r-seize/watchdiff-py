@@ -51,7 +51,7 @@ _VERBOSE_OPT  = typer.Option(False, "--verbose", "-v", help="Enable debug loggin
                               envvar="WATCHDIFF_VERBOSE")
 
 _CONFIG_FILE  = "watchdiff.config.json"
-_VALID_DIFF_MODES = {"line", "semantic", "word", "json"}
+_VALID_DIFF_MODES = {"line", "semantic", "word", "json", "rss"}
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +245,21 @@ def cmd_run(
     ignore_numbers: bool    = typer.Option(False, "--ignore-numbers",
                                            help="Strip digit tokens before diffing.",
                                            envvar="WATCHDIFF_IGNORE_NUMBERS"),
+    archive_html: bool      = typer.Option(False, "--archive-html",
+                                           help="Save full HTML to disk on every change.",
+                                           envvar="WATCHDIFF_ARCHIVE_HTML"),
+    screenshot: bool        = typer.Option(False, "--screenshot",
+                                           help="Save PNG screenshot on change (requires --browser).",
+                                           envvar="WATCHDIFF_SCREENSHOT"),
+    spike_window: int       = typer.Option(0, "--spike-window",
+                                           help="Change spike detection window in seconds (0 = off).",
+                                           envvar="WATCHDIFF_SPIKE_WINDOW"),
+    spike_threshold: int    = typer.Option(0, "--spike-threshold",
+                                           help="Alert when this many changes occur in spike window.",
+                                           envvar="WATCHDIFF_SPIKE_THRESHOLD"),
+    status_port: int        = typer.Option(0, "--status-port",
+                                           help="Start status HTTP server on this port (0 = off).",
+                                           envvar="WATCHDIFF_STATUS_PORT"),
     config_file: str | None = typer.Option(None, "--config", "-c",
                                            help="Load watchers from a JSON config file."),
 ) -> None:
@@ -270,23 +285,31 @@ def cmd_run(
     wd = WatchDiff(storage_dir=storage)
     wd.watch(
         url,
-        target           = target,
-        interval         = interval,
-        webhooks         = webhook or [],
-        diff_mode        = diff_mode,
-        browser          = browser,
-        cooldown         = cooldown,
-        dry_run          = dry_run,
-        retries          = retries,
-        jitter           = jitter,
-        max_snapshots    = max_snapshots or None,
-        change_threshold = change_threshold or None,
-        ignore_numbers   = ignore_numbers,
+        target                 = target,
+        interval               = interval,
+        webhooks               = webhook or [],
+        diff_mode              = diff_mode,
+        browser                = browser,
+        cooldown               = cooldown,
+        dry_run                = dry_run,
+        retries                = retries,
+        jitter                 = jitter,
+        max_snapshots          = max_snapshots or None,
+        change_threshold       = change_threshold or None,
+        ignore_numbers         = ignore_numbers,
+        archive_html           = archive_html,
+        screenshot_on_change   = screenshot,
+        change_spike_window    = spike_window or None,
+        change_spike_threshold = spike_threshold or None,
     )
     wd.on_change(_print_report)
 
     cooldown_label  = f"{cooldown}s" if cooldown > 0 else "off"
     dry_run_label   = "[yellow]dry-run[/]" if dry_run else "off"
+    status_line = ""
+    if status_port > 0:
+        status_line = f"\nStatus API: [cyan]http://localhost:{status_port}/status[/]"
+
     console.print(
         Panel(
             f"[bold cyan]WatchDiff[/] monitoring [green]{url}[/]\n"
@@ -297,12 +320,66 @@ def cmd_run(
             f"Browser:   [yellow]{browser}[/]  "
             f"Cooldown:  [yellow]{cooldown_label}[/]\n"
             f"Retries:   [yellow]{retries}[/]  "
-            f"Dry-run:   {dry_run_label}\n"
+            f"Dry-run:   {dry_run_label}"
+            f"{status_line}\n"
             f"Press [bold]Ctrl+C[/] to stop.",
             title="WatchDiff",
         )
     )
-    wd.start(block=True)
+
+    if status_port > 0:
+        wd.start(block=False)
+        wd.start_status_server(port=status_port)
+        try:
+            while True:
+                import time as _time  # noqa: PLC0415
+                _time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    else:
+        wd.start(block=True)
+
+
+@app.command("compare")
+def cmd_compare(
+    url_a: str             = typer.Argument(..., help="First URL (treated as 'before')."),
+    url_b: str             = typer.Argument(..., help="Second URL (treated as 'after')."),
+    target: str | None     = _TARGET_OPT,
+    diff_mode: str         = typer.Option("line", "--diff-mode",
+                                          help="Diff mode: line | semantic | word | json | rss."),
+    browser: bool          = typer.Option(False, "--browser", help="Use headless browser."),
+    timeout: int           = typer.Option(15, "--timeout", help="HTTP timeout in seconds."),
+    ignore_selector: list[str] = typer.Option([], "--ignore-selector",
+                                              help="CSS selector to strip (repeatable)."),
+    ignore_pattern: list[str]  = typer.Option([], "--ignore-pattern",
+                                              help="Regex pattern to strip (repeatable)."),
+    proxy: list[str]           = typer.Option([], "--proxy",
+                                              help="Proxy URL (repeatable)."),
+    user_agent: list[str]      = typer.Option([], "--user-agent",
+                                              help="User-Agent string (repeatable)."),
+    output_json: bool      = typer.Option(False, "--json", help="Output raw JSON."),
+    verbose: bool          = _VERBOSE_OPT,
+) -> None:
+    """Fetch two URLs and compare their content."""
+    _setup_logging(verbose)
+
+    wd     = WatchDiff()
+    report = wd.compare_urls(
+        url_a, url_b,
+        target           = target,
+        diff_mode        = diff_mode,
+        browser          = browser,
+        timeout          = timeout,
+        ignore_selectors = ignore_selector or [],
+        ignore_patterns  = ignore_pattern or [],
+        proxies          = proxy or [],
+        user_agents      = user_agent or [],
+    )
+
+    if output_json:
+        typer.echo(json.dumps(report.as_dict(), indent=2, ensure_ascii=False))
+    else:
+        _render_report(report)
 
 
 @app.command("check")

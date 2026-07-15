@@ -15,6 +15,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import xml.etree.ElementTree as ET
 
 from watchdiff.models import Change, ChangeType, DiffReport, Snapshot, WatchConfig
 
@@ -48,6 +49,17 @@ class DiffEngine:
             )
 
         mode = config.diff_mode
+
+        # RSS mode: item-level feed diff
+        if mode == "rss":
+            changes = _rss_diff(before.raw_html or before.content, after.raw_html or after.content)
+            if not changes:
+                changes = _sequence_diff(_split_content(before.content), _split_content(after.content))
+            return DiffReport(
+                url=config.url, target=config.target,
+                label=config.label or config.url,
+                before=before, after=after, changes=changes,
+            )
 
         # JSON mode: recursive key-path walk, fallback to line
         if mode == "json":
@@ -170,6 +182,72 @@ def _walk_json(before: object, after: object, path: list[str], changes: list[Cha
                 after   = _repr(after),
                 context = key_path,
             ))
+
+
+def _rss_diff(before_xml: str, after_xml: str) -> list[Change]:
+    """Item-level diff for RSS 2.0 / Atom feeds. Returns [] if no items found."""
+    before_items = _parse_feed_items(before_xml)
+    after_items  = _parse_feed_items(after_xml)
+    if not before_items and not after_items:
+        return []
+
+    before_by_id = {i["id"]: i for i in before_items}
+    after_by_id  = {i["id"]: i for i in after_items}
+    changes: list[Change] = []
+
+    for item in after_items:
+        if item["id"] not in before_by_id:
+            changes.append(Change(kind=ChangeType.ADDED, after=item["title"], context=item.get("link") or item["id"]))
+
+    for item in before_items:
+        if item["id"] not in after_by_id:
+            changes.append(Change(kind=ChangeType.REMOVED, before=item["title"], context=item.get("link") or item["id"]))
+
+    for after_item in after_items:
+        before_item = before_by_id.get(after_item["id"])
+        if before_item and before_item["title"] != after_item["title"]:
+            changes.append(Change(
+                kind=ChangeType.MODIFIED,
+                before=before_item["title"],
+                after=after_item["title"],
+                context=after_item.get("link") or after_item["id"],
+            ))
+
+    return changes
+
+
+def _parse_feed_items(xml_text: str) -> list[dict]:
+    try:
+        root = ET.fromstring(xml_text.strip())
+    except ET.ParseError:
+        return []
+
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+    # RSS 2.0
+    items = root.findall(".//item")
+    if items:
+        result = []
+        for el in items:
+            title = (el.findtext("title") or "").strip()
+            link  = (el.findtext("link") or "").strip()
+            guid  = (el.findtext("guid") or "").strip()
+            result.append({"id": guid or link or title, "title": title, "link": link})
+        return result
+
+    # Atom
+    entries = root.findall("atom:entry", ns) or root.findall("entry")
+    if entries:
+        result = []
+        for el in entries:
+            title   = (el.findtext("atom:title", namespaces=ns) or el.findtext("title") or "").strip()
+            id_     = (el.findtext("atom:id", namespaces=ns) or el.findtext("id") or "").strip()
+            link_el = el.find("atom:link", ns) or el.find("link")
+            link    = (link_el.get("href", "") if link_el is not None else "").strip()
+            result.append({"id": id_ or link or title, "title": title, "link": link})
+        return result
+
+    return []
 
 
 def _repr(value: object) -> str:

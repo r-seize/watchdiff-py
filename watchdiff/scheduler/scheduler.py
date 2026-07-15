@@ -30,10 +30,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from pathlib import Path
+
 from watchdiff.cleaner import Cleaner
 from watchdiff.diff import DiffEngine
 from watchdiff.fetcher import AsyncFetcher, Fetcher
-from watchdiff.models import DiffReport, SilenceInfo, WatchConfig, WatcherStatus
+from watchdiff.models import DiffReport, SilenceInfo, SpikeInfo, WatchConfig, WatcherStatus
 from watchdiff.notifier import Notifier
 from watchdiff.parser import Parser, ParserError
 
@@ -53,6 +55,7 @@ class SyncScheduler:
     def __init__(self, store: Any) -> None:
         self._store                                                  = store
         self._fetcher                                                = Fetcher()
+        self._browser_fetcher: Any                                   = None  # lazy-init on first browser use
         self._parser                                                 = Parser()
         self._engine                                                 = DiffEngine()
         self._notifier                                               = Notifier()
@@ -68,7 +71,10 @@ class SyncScheduler:
         self._watcher_start: dict[str, float]                        = {}
         self._checks_count: dict[str, int]                           = {}
         self._changes_count: dict[str, int]                          = {}
+        self._errors_count: dict[str, int]                           = {}
         self._silence_fired: dict[str, bool]                         = {}
+        self._recent_change_times: dict[str, list[float]]            = {}
+        self._last_spike_at: dict[str, float]                        = {}
 
     def add_global_callback(self, callback: Callable[[DiffReport], None]) -> None:
         """Register a callback called for every DiffReport (regardless of config)."""
@@ -137,8 +143,9 @@ class SyncScheduler:
                 last_check_at  = datetime.fromtimestamp(last_check, tz=timezone.utc) if last_check else None,
                 next_check_at  = datetime.fromtimestamp(next_check, tz=timezone.utc) if next_check else None,
                 last_change_at = datetime.fromtimestamp(last_change, tz=timezone.utc) if last_change else None,
-                checks_count   = self._checks_count.get(key, 0),
-                changes_count  = self._changes_count.get(key, 0),
+                checks_count      = self._checks_count.get(key, 0),
+                changes_count     = self._changes_count.get(key, 0),
+                errors_count      = self._errors_count.get(key, 0),
             ))
         return result
 
@@ -154,9 +161,12 @@ class SyncScheduler:
         """Thread target: check, sleep, repeat."""
         key = _cooldown_key(config)
         self._watcher_start[key] = time.time()
-        self._checks_count[key]  = 0
-        self._changes_count[key] = 0
-        self._silence_fired[key] = False
+        self._checks_count[key]        = 0
+        self._changes_count[key]       = 0
+        self._errors_count[key]        = 0
+        self._silence_fired[key]       = False
+        self._recent_change_times[key] = []
+        self._last_spike_at[key]       = 0.0
 
         while not stop_event.is_set():
             if config.url not in self._paused:
@@ -173,8 +183,10 @@ class SyncScheduler:
     def _fetch(self, config: WatchConfig) -> str:
         """Dispatch to BrowserFetcher or Fetcher based on config.browser."""
         if config.browser:
-            from watchdiff.fetcher.browser import BrowserFetcher  # noqa: PLC0415
-            return BrowserFetcher().fetch(config)
+            if self._browser_fetcher is None:
+                from watchdiff.fetcher.browser import BrowserFetcher  # noqa: PLC0415
+                self._browser_fetcher = BrowserFetcher()
+            return self._browser_fetcher.fetch(config)
         return self._fetcher.fetch(config)
 
     def _check(self, config: WatchConfig) -> DiffReport | None:
@@ -189,6 +201,7 @@ class SyncScheduler:
         try:
             html = self._fetch(config)
         except Exception as exc:  # noqa: BLE001
+            self._errors_count[key] = self._errors_count.get(key, 0) + 1
             logger.error("[%s] Fetch failed: %s", config.label, exc)
             if config.on_error:
                 try:
@@ -206,6 +219,7 @@ class SyncScheduler:
         try:
             snapshot = self._parser.extract(soup, config)
         except ParserError as exc:
+            self._errors_count[key] = self._errors_count.get(key, 0) + 1
             logger.error("[%s] Parse failed: %s", config.label, exc)
             return None
 
@@ -245,6 +259,68 @@ class SyncScheduler:
             self._last_change_at[key] = time.time()
             self._silence_fired[key]  = False
             logger.info("[%s] %s", config.label, report.summary())
+
+            # Spike detection
+            if config.change_spike_window and config.change_spike_threshold:
+                now_ts = time.time()
+                times  = self._recent_change_times.get(key, [])
+                times  = [t for t in times if now_ts - t < config.change_spike_window]
+                times.append(now_ts)
+                self._recent_change_times[key] = times
+                last_spike = self._last_spike_at.get(key, 0.0)
+                if (
+                    len(times) >= config.change_spike_threshold
+                    and now_ts - last_spike > config.change_spike_window
+                ):
+                    self._last_spike_at[key] = now_ts
+                    logger.warning(
+                        "[%s] Change spike: %d changes in %ds",
+                        config.label, len(times), config.change_spike_window,
+                    )
+                    if config.on_spike:
+                        try:
+                            config.on_spike(SpikeInfo(
+                                url               = config.url,
+                                label             = config.label or config.url,
+                                changes_in_window = len(times),
+                                window_seconds    = config.change_spike_window,
+                            ))
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("[%s] on_spike callback error: %s", config.label, exc)
+
+            # HTML archiving
+            if config.archive_html and not config.dry_run:
+                try:
+                    store_dir   = getattr(self._store, "get_directory", lambda: Path(".watchdiff"))()
+                    archive_dir = Path(store_dir) / "archive"
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    import hashlib  # noqa: PLC0415
+                    url_hash = hashlib.md5(config.url.encode()).hexdigest()[:8]
+                    ts       = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                    dest     = archive_dir / f"{url_hash}_{ts}.html"
+                    dest.write_text(snapshot.raw_html or html, encoding="utf-8")
+                    logger.debug("[%s] HTML archived: %s", config.label, dest)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] HTML archive failed: %s", config.label, exc)
+
+            # Screenshot on change
+            if config.screenshot_on_change and config.browser and not config.dry_run:
+                try:
+                    if self._browser_fetcher is None:
+                        from watchdiff.fetcher.browser import BrowserFetcher  # noqa: PLC0415
+                        self._browser_fetcher = BrowserFetcher()
+                    store_dir   = getattr(self._store, "get_directory", lambda: Path(".watchdiff"))()
+                    archive_dir = Path(store_dir) / "archive"
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    import hashlib  # noqa: PLC0415
+                    url_hash = hashlib.md5(config.url.encode()).hexdigest()[:8]
+                    ts       = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                    dest     = archive_dir / f"{url_hash}_{ts}.png"
+                    buf      = self._browser_fetcher.screenshot(config)
+                    dest.write_bytes(buf)
+                    logger.debug("[%s] Screenshot saved: %s", config.label, dest)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] Screenshot failed: %s", config.label, exc)
 
             if self._cooldown_ok(config):
                 for cb in self._on_diff_callbacks:
@@ -308,6 +384,7 @@ class AsyncScheduler:
     def __init__(self, store: Any) -> None:
         self._store                                                  = store
         self._fetcher                                                = AsyncFetcher()
+        self._browser_fetcher: Any                                   = None  # lazy-init on first browser use
         self._parser                                                 = Parser()
         self._engine                                                 = DiffEngine()
         self._notifier                                               = Notifier()
@@ -321,7 +398,10 @@ class AsyncScheduler:
         self._watcher_start: dict[str, float]                        = {}
         self._checks_count: dict[str, int]                           = {}
         self._changes_count: dict[str, int]                          = {}
+        self._errors_count: dict[str, int]                           = {}
         self._silence_fired: dict[str, bool]                         = {}
+        self._recent_change_times: dict[str, list[float]]            = {}
+        self._last_spike_at: dict[str, float]                        = {}
 
     def add_global_callback(self, callback: Callable[[DiffReport], None]) -> None:
         self._on_diff_callbacks.append(callback)
@@ -361,6 +441,7 @@ class AsyncScheduler:
                 last_change_at = datetime.fromtimestamp(last_change, tz=timezone.utc) if last_change else None,
                 checks_count   = self._checks_count.get(key, 0),
                 changes_count  = self._changes_count.get(key, 0),
+                errors_count   = self._errors_count.get(key, 0),
             ))
         return result
 
@@ -370,10 +451,13 @@ class AsyncScheduler:
 
     async def _run_loop(self, config: WatchConfig) -> None:
         key = _cooldown_key(config)
-        self._watcher_start[key] = time.time()
-        self._checks_count[key]  = 0
-        self._changes_count[key] = 0
-        self._silence_fired[key] = False
+        self._watcher_start[key]       = time.time()
+        self._checks_count[key]        = 0
+        self._changes_count[key]       = 0
+        self._errors_count[key]        = 0
+        self._silence_fired[key]       = False
+        self._recent_change_times[key] = []
+        self._last_spike_at[key]       = 0.0
 
         while True:
             if config.url not in self._paused:
@@ -390,8 +474,10 @@ class AsyncScheduler:
     async def _fetch(self, config: WatchConfig) -> str:
         """Dispatch to AsyncBrowserFetcher or AsyncFetcher based on config.browser."""
         if config.browser:
-            from watchdiff.fetcher.browser import AsyncBrowserFetcher  # noqa: PLC0415
-            return await AsyncBrowserFetcher().fetch(config)
+            if self._browser_fetcher is None:
+                from watchdiff.fetcher.browser import AsyncBrowserFetcher  # noqa: PLC0415
+                self._browser_fetcher = AsyncBrowserFetcher()
+            return await self._browser_fetcher.fetch(config)
         return await self._fetcher.fetch(config)
 
     async def _check(self, config: WatchConfig) -> DiffReport | None:
@@ -406,6 +492,7 @@ class AsyncScheduler:
         try:
             html = await self._fetch(config)
         except Exception as exc:  # noqa: BLE001
+            self._errors_count[key] = self._errors_count.get(key, 0) + 1
             logger.error("[%s] Fetch failed: %s", config.label, exc)
             if config.on_error:
                 try:
@@ -423,6 +510,7 @@ class AsyncScheduler:
         try:
             snapshot = self._parser.extract(soup, config)
         except ParserError as exc:
+            self._errors_count[key] = self._errors_count.get(key, 0) + 1
             logger.error("[%s] Parse failed: %s", config.label, exc)
             return None
 
@@ -462,6 +550,68 @@ class AsyncScheduler:
             self._last_change_at[key] = time.time()
             self._silence_fired[key]  = False
             logger.info("[%s] %s", config.label, report.summary())
+
+            # Spike detection
+            if config.change_spike_window and config.change_spike_threshold:
+                now_ts = time.time()
+                times  = self._recent_change_times.get(key, [])
+                times  = [t for t in times if now_ts - t < config.change_spike_window]
+                times.append(now_ts)
+                self._recent_change_times[key] = times
+                last_spike = self._last_spike_at.get(key, 0.0)
+                if (
+                    len(times) >= config.change_spike_threshold
+                    and now_ts - last_spike > config.change_spike_window
+                ):
+                    self._last_spike_at[key] = now_ts
+                    logger.warning(
+                        "[%s] Change spike: %d changes in %ds",
+                        config.label, len(times), config.change_spike_window,
+                    )
+                    if config.on_spike:
+                        try:
+                            config.on_spike(SpikeInfo(
+                                url               = config.url,
+                                label             = config.label or config.url,
+                                changes_in_window = len(times),
+                                window_seconds    = config.change_spike_window,
+                            ))
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("[%s] on_spike callback error: %s", config.label, exc)
+
+            # HTML archiving
+            if config.archive_html and not config.dry_run:
+                try:
+                    import hashlib  # noqa: PLC0415
+                    store_dir   = getattr(self._store, "get_directory", lambda: Path(".watchdiff"))()
+                    archive_dir = Path(store_dir) / "archive"
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    url_hash = hashlib.md5(config.url.encode()).hexdigest()[:8]
+                    ts       = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                    dest     = archive_dir / f"{url_hash}_{ts}.html"
+                    dest.write_text(snapshot.raw_html or html, encoding="utf-8")
+                    logger.debug("[%s] HTML archived: %s", config.label, dest)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] HTML archive failed: %s", config.label, exc)
+
+            # Screenshot on change
+            if config.screenshot_on_change and config.browser and not config.dry_run:
+                try:
+                    import hashlib  # noqa: PLC0415
+                    if self._browser_fetcher is None:
+                        from watchdiff.fetcher.browser import AsyncBrowserFetcher  # noqa: PLC0415
+                        self._browser_fetcher = AsyncBrowserFetcher()
+                    store_dir   = getattr(self._store, "get_directory", lambda: Path(".watchdiff"))()
+                    archive_dir = Path(store_dir) / "archive"
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    url_hash = hashlib.md5(config.url.encode()).hexdigest()[:8]
+                    ts       = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                    dest     = archive_dir / f"{url_hash}_{ts}.png"
+                    buf      = await self._browser_fetcher.screenshot(config)
+                    dest.write_bytes(buf)
+                    logger.debug("[%s] Screenshot saved: %s", config.label, dest)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] Screenshot failed: %s", config.label, exc)
 
             if self._cooldown_ok(config):
                 for cb in self._on_diff_callbacks:

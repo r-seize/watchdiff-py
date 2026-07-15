@@ -68,6 +68,10 @@ class Store:
         if len(history) > max_snapshots:
             self._save_raw(path, history[-max_snapshots:])
 
+    def get_directory(self) -> Path:
+        """Return the storage directory path."""
+        return self.directory
+
     def clear_history(self, url: str, target: str | None) -> None:
         """Delete all stored snapshots for a URL + target combo."""
         path = self._snapshot_path(url, target)

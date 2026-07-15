@@ -84,6 +84,36 @@ class AsyncBrowserFetcher:
                 f"Browser fetch failed for {config.url}: {exc}"
             ) from exc
 
+    async def screenshot(self, config: WatchConfig) -> bytes:
+        """Capture a full-page PNG screenshot. Returns raw PNG bytes."""
+        try:
+            from playwright.async_api import async_playwright  # noqa: PLC0415
+        except ImportError as exc:
+            raise BrowserFetchError(
+                "playwright is not installed. "
+                "Run: pip install 'watchdiff-core[browser]' && playwright install chromium"
+            ) from exc
+
+        opts       = config.browser_options
+        wait_until = opts.wait_for if opts else "load"
+        wait_sel   = opts.wait_for_selector if opts else None
+        timeout_ms = opts.timeout if opts else 30000
+
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                page    = await browser.new_page()
+                await page.goto(config.url, wait_until=wait_until, timeout=timeout_ms)
+                if wait_sel:
+                    await page.wait_for_selector(wait_sel, timeout=timeout_ms)
+                buf = await page.screenshot(full_page=True, type="png")
+                await browser.close()
+                return buf
+        except BrowserFetchError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise BrowserFetchError(f"Screenshot failed for {config.url}: {exc}") from exc
+
 
 class BrowserFetcher:
     """Synchronous wrapper around AsyncBrowserFetcher - runs asyncio event loop internally."""
@@ -102,3 +132,7 @@ class BrowserFetcher:
             BrowserFetchError: if playwright is not installed or page load fails.
         """
         return asyncio.run(AsyncBrowserFetcher().fetch(config))
+
+    def screenshot(self, config: WatchConfig) -> bytes:
+        """Capture a full-page PNG screenshot (sync). Returns raw PNG bytes."""
+        return asyncio.run(AsyncBrowserFetcher().screenshot(config))
