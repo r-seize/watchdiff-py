@@ -66,6 +66,10 @@ def _backoff(attempt: int, retry_delay: float) -> float:
 class FetchError(Exception):
     """Raised when an HTTP request fails."""
 
+    def __init__(self, message: str, status_code: int = 0) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class Fetcher:
     """Synchronous HTTP fetcher with UA/proxy rotation and retry backoff."""
@@ -103,15 +107,16 @@ class Fetcher:
                     resp.raise_for_status()
                     return resp.text
             except httpx.HTTPStatusError as exc:
-                last_exc = FetchError(f"HTTP {exc.response.status_code} for {config.url}")
-                if exc.response.status_code not in _RETRYABLE_STATUS or attempt >= config.retries:
-                    raise FetchError(f"HTTP {exc.response.status_code} for {config.url}") from exc
+                code     = exc.response.status_code
+                last_exc = FetchError(f"HTTP {code} for {config.url}", status_code=code)
+                if code not in _RETRYABLE_STATUS or attempt >= config.retries:
+                    raise FetchError(f"HTTP {code} for {config.url}", status_code=code) from exc
             except httpx.RequestError as exc:
-                last_exc = FetchError(f"Request failed for {config.url}: {exc}")
+                last_exc = FetchError(f"Request failed for {config.url}: {exc}", status_code=0)
                 if attempt >= config.retries:
-                    raise FetchError(f"Request failed for {config.url}: {exc}") from exc
+                    raise FetchError(f"Request failed for {config.url}: {exc}", status_code=0) from exc
 
-        raise last_exc or FetchError(f"All retries exhausted for {config.url}")
+        raise last_exc or FetchError(f"All retries exhausted for {config.url}", status_code=0)
 
 
 class AsyncFetcher:
@@ -150,12 +155,13 @@ class AsyncFetcher:
                     resp.raise_for_status()
                     return resp.text
             except httpx.HTTPStatusError as exc:
-                last_exc = FetchError(f"HTTP {exc.response.status_code} for {config.url}")
-                if exc.response.status_code not in _RETRYABLE_STATUS or attempt >= config.retries:
-                    raise FetchError(f"HTTP {exc.response.status_code} for {config.url}") from exc
+                code     = exc.response.status_code
+                last_exc = FetchError(f"HTTP {code} for {config.url}", status_code=code)
+                if code not in _RETRYABLE_STATUS or attempt >= config.retries:
+                    raise FetchError(f"HTTP {code} for {config.url}", status_code=code) from exc
             except httpx.RequestError as exc:
-                last_exc = FetchError(f"Request failed for {config.url}: {exc}")
+                last_exc = FetchError(f"Request failed for {config.url}: {exc}", status_code=0)
                 if attempt >= config.retries:
-                    raise FetchError(f"Request failed for {config.url}: {exc}") from exc
+                    raise FetchError(f"Request failed for {config.url}: {exc}", status_code=0) from exc
 
-        raise last_exc or FetchError(f"All retries exhausted for {config.url}")
+        raise last_exc or FetchError(f"All retries exhausted for {config.url}", status_code=0)

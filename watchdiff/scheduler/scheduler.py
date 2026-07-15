@@ -35,7 +35,7 @@ from pathlib import Path
 from watchdiff.cleaner import Cleaner
 from watchdiff.diff import DiffEngine
 from watchdiff.fetcher import AsyncFetcher, Fetcher
-from watchdiff.models import DiffReport, SilenceInfo, SpikeInfo, WatchConfig, WatcherStatus
+from watchdiff.models import DiffReport, SilenceInfo, SpikeInfo, StatusChangeInfo, WatchConfig, WatcherStatus
 from watchdiff.notifier import Notifier
 from watchdiff.parser import Parser, ParserError
 
@@ -75,6 +75,7 @@ class SyncScheduler:
         self._silence_fired: dict[str, bool]                         = {}
         self._recent_change_times: dict[str, list[float]]            = {}
         self._last_spike_at: dict[str, float]                        = {}
+        self._last_status_code: dict[str, int]                       = {}
 
     def add_global_callback(self, callback: Callable[[DiffReport], None]) -> None:
         """Register a callback called for every DiffReport (regardless of config)."""
@@ -146,6 +147,7 @@ class SyncScheduler:
                 checks_count      = self._checks_count.get(key, 0),
                 changes_count     = self._changes_count.get(key, 0),
                 errors_count      = self._errors_count.get(key, 0),
+                last_status_code  = self._last_status_code.get(key, 0),
             ))
         return result
 
@@ -167,6 +169,7 @@ class SyncScheduler:
         self._silence_fired[key]       = False
         self._recent_change_times[key] = []
         self._last_spike_at[key]       = 0.0
+        self._last_status_code[key]    = 0
 
         while not stop_event.is_set():
             if config.url not in self._paused:
@@ -203,12 +206,16 @@ class SyncScheduler:
         except Exception as exc:  # noqa: BLE001
             self._errors_count[key] = self._errors_count.get(key, 0) + 1
             logger.error("[%s] Fetch failed: %s", config.label, exc)
+            current_status = getattr(exc, "status_code", 0)
+            self._handle_status_change(key, current_status, config)
             if config.on_error:
                 try:
                     config.on_error(exc, config)
                 except Exception as cb_exc:  # noqa: BLE001
                     logger.warning("[%s] on_error callback error: %s", config.label, cb_exc)
             return None
+
+        self._handle_status_change(key, 200, config)
 
         cleaner = Cleaner(
             extra_selectors = config.ignore_selectors,
@@ -367,6 +374,57 @@ class SyncScheduler:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[%s] on_silence callback error: %s", config.label, exc)
 
+    def _handle_status_change(self, key: str, current_status: int, config: WatchConfig) -> None:
+        prev = self._last_status_code.get(key, 0)
+        self._last_status_code[key] = current_status
+
+        if not config.alert_on_status_change or prev == 0 or prev == current_status:
+            return
+
+        label = (
+            f"recovered ({prev} → 200)"
+            if current_status == 200
+            else f"{prev} → {current_status or 'unreachable'}"
+        )
+        logger.warning("[%s] HTTP status changed: %s", config.label, label)
+
+        info = StatusChangeInfo(
+            url             = config.url,
+            label           = config.label or config.url,
+            previous_status = prev,
+            current_status  = current_status,
+        )
+
+        if config.on_status_change:
+            try:
+                config.on_status_change(info)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] on_status_change callback error: %s", config.label, exc)
+
+        if not config.dry_run and config.alert:
+            from watchdiff.models import Change, ChangeType, Snapshot  # noqa: PLC0415
+            from datetime import datetime, timezone  # noqa: PLC0415
+            now      = datetime.now(timezone.utc)
+            empty    = Snapshot(url=config.url, target=config.target, content="", raw_html="")
+            fake_report = DiffReport(
+                url         = config.url,
+                target      = config.target,
+                label       = config.label or config.url,
+                before      = empty,
+                after       = empty,
+                changes     = [Change(
+                    kind    = ChangeType.MODIFIED,
+                    before  = str(prev),
+                    after   = str(current_status) if current_status else "unreachable",
+                    context = "http_status",
+                )],
+                compared_at = now,
+            )
+            try:
+                self._notifier.notify(fake_report, config.alert)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] Status change webhook error: %s", config.label, exc)
+
     def _cooldown_ok(self, config: WatchConfig) -> bool:
         if config.cooldown <= 0:
             return True
@@ -402,6 +460,7 @@ class AsyncScheduler:
         self._silence_fired: dict[str, bool]                         = {}
         self._recent_change_times: dict[str, list[float]]            = {}
         self._last_spike_at: dict[str, float]                        = {}
+        self._last_status_code: dict[str, int]                       = {}
 
     def add_global_callback(self, callback: Callable[[DiffReport], None]) -> None:
         self._on_diff_callbacks.append(callback)
@@ -439,9 +498,10 @@ class AsyncScheduler:
                 last_check_at  = datetime.fromtimestamp(last_check, tz=timezone.utc) if last_check else None,
                 next_check_at  = datetime.fromtimestamp(next_check, tz=timezone.utc) if next_check else None,
                 last_change_at = datetime.fromtimestamp(last_change, tz=timezone.utc) if last_change else None,
-                checks_count   = self._checks_count.get(key, 0),
-                changes_count  = self._changes_count.get(key, 0),
-                errors_count   = self._errors_count.get(key, 0),
+                checks_count      = self._checks_count.get(key, 0),
+                changes_count     = self._changes_count.get(key, 0),
+                errors_count      = self._errors_count.get(key, 0),
+                last_status_code  = self._last_status_code.get(key, 0),
             ))
         return result
 
@@ -458,6 +518,7 @@ class AsyncScheduler:
         self._silence_fired[key]       = False
         self._recent_change_times[key] = []
         self._last_spike_at[key]       = 0.0
+        self._last_status_code[key]    = 0
 
         while True:
             if config.url not in self._paused:
@@ -494,12 +555,16 @@ class AsyncScheduler:
         except Exception as exc:  # noqa: BLE001
             self._errors_count[key] = self._errors_count.get(key, 0) + 1
             logger.error("[%s] Fetch failed: %s", config.label, exc)
+            current_status = getattr(exc, "status_code", 0)
+            await self._handle_status_change(key, current_status, config)
             if config.on_error:
                 try:
                     config.on_error(exc, config)
                 except Exception as cb_exc:  # noqa: BLE001
                     logger.warning("[%s] on_error callback error: %s", config.label, cb_exc)
             return None
+
+        await self._handle_status_change(key, 200, config)
 
         cleaner = Cleaner(
             extra_selectors = config.ignore_selectors,
@@ -657,6 +722,57 @@ class AsyncScheduler:
                 ))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[%s] on_silence callback error: %s", config.label, exc)
+
+    async def _handle_status_change(self, key: str, current_status: int, config: WatchConfig) -> None:
+        prev = self._last_status_code.get(key, 0)
+        self._last_status_code[key] = current_status
+
+        if not config.alert_on_status_change or prev == 0 or prev == current_status:
+            return
+
+        label = (
+            f"recovered ({prev} → 200)"
+            if current_status == 200
+            else f"{prev} → {current_status or 'unreachable'}"
+        )
+        logger.warning("[%s] HTTP status changed: %s", config.label, label)
+
+        info = StatusChangeInfo(
+            url             = config.url,
+            label           = config.label or config.url,
+            previous_status = prev,
+            current_status  = current_status,
+        )
+
+        if config.on_status_change:
+            try:
+                config.on_status_change(info)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] on_status_change callback error: %s", config.label, exc)
+
+        if not config.dry_run and config.alert:
+            from watchdiff.models import Change, ChangeType, Snapshot  # noqa: PLC0415
+            from datetime import datetime, timezone  # noqa: PLC0415
+            now      = datetime.now(timezone.utc)
+            empty    = Snapshot(url=config.url, target=config.target, content="", raw_html="")
+            fake_report = DiffReport(
+                url         = config.url,
+                target      = config.target,
+                label       = config.label or config.url,
+                before      = empty,
+                after       = empty,
+                changes     = [Change(
+                    kind    = ChangeType.MODIFIED,
+                    before  = str(prev),
+                    after   = str(current_status) if current_status else "unreachable",
+                    context = "http_status",
+                )],
+                compared_at = now,
+            )
+            try:
+                self._notifier.notify(fake_report, config.alert)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] Status change webhook error: %s", config.label, exc)
 
     def _cooldown_ok(self, config: WatchConfig) -> bool:
         if config.cooldown <= 0:

@@ -42,6 +42,7 @@ from watchdiff.models import (
     DiffReport,
     SilenceInfo,
     SpikeInfo,
+    StatusChangeInfo,
     WatchConfig,
     WatcherStatus,
 )
@@ -116,6 +117,8 @@ class WatchDiff:
         change_spike_window: int | None                                                        = None,
         change_spike_threshold: int | None                                                     = None,
         on_spike: Callable[[SpikeInfo], None] | None                                          = None,
+        alert_on_status_change: bool                                                           = False,
+        on_status_change: Callable[[StatusChangeInfo], None] | None                           = None,
     ) -> WatchDiff:
         """
         Register a URL to monitor.
@@ -198,6 +201,8 @@ class WatchDiff:
             change_spike_window      = change_spike_window,
             change_spike_threshold   = change_spike_threshold,
             on_spike                 = on_spike,
+            alert_on_status_change   = alert_on_status_change,
+            on_status_change         = on_status_change,
         )
         self._configs.append(config)
         return self

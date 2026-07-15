@@ -34,6 +34,7 @@ No noisy HTML diffs. No external services. No AI black boxes.
 | Archive HTML on change | `archive_html=True` |
 | Screenshot on change | `screenshot_on_change=True, browser=True` |
 | Detect change spikes | `change_spike_window=60, change_spike_threshold=5` |
+| Alert on HTTP status change | `alert_on_status_change=True` (200→503, 503→200, etc.) |
 | Compare two different URLs | `.compare_urls(url_a, url_b)` / `watchdiff compare <urlA> <urlB>` |
 | Persist to SQLite | `WatchDiff(store=SqliteStore(".watchdiff.db"))` |
 | Export history | `.export_reports_csv(url)` / `.export_reports_xlsx(url)` |
@@ -66,6 +67,7 @@ No noisy HTML diffs. No external services. No AI black boxes.
   - [HTML archiving](#html-archiving)
   - [Screenshot on change](#screenshot-on-change)
   - [Change spike detection](#change-spike-detection)
+  - [HTTP status code monitoring](#http-status-code-monitoring)
   - [URL comparison](#url-comparison)
   - [XPath selectors](#xpath-selectors)
   - [SQLite storage backend](#sqlite-storage-backend)
@@ -158,6 +160,13 @@ watchdiff run https://example.com --interval 60 --status-port 9090
 
 # Show status from config file
 watchdiff status
+watchdiff status --json
+
+# Export history / reports
+watchdiff export https://example.com                                     # CSV to stdout
+watchdiff export https://example.com --output reports.csv               # write to file
+watchdiff export https://example.com --type snapshots --output snap.csv # snapshots
+watchdiff export https://example.com --format xlsx --output reports.xlsx # XLSX
 
 # Snapshot history and reports
 watchdiff history https://example.com
@@ -499,7 +508,7 @@ wd.start(block=False)
 
 statuses = wd.status()
 for s in statuses:
-    print(s.url, s.checks_count, s.changes_count, s.errors_count, s.paused)
+    print(s.url, s.checks_count, s.changes_count, s.errors_count, s.paused, s.last_status_code)
 ```
 
 `WatcherStatus` fields:
@@ -517,6 +526,7 @@ for s in statuses:
 | `checks_count` | `int` | Total checks since start |
 | `changes_count` | `int` | Total changes detected since start |
 | `errors_count` | `int` | Total fetch/parse errors since start |
+| `last_status_code` | `int` | Last HTTP status code (0 = unknown/unreachable) |
 
 Returns an empty list if `.start()` has not been called yet.
 
@@ -546,8 +556,9 @@ watchdiff_changes_total{url="...",label="..."} 3
 watchdiff_errors_total{url="...",label="..."} 0
 watchdiff_paused{url="...",label="..."} 0
 watchdiff_interval_seconds{url="...",label="..."} 300
-watchdiff_last_check_timestamp{url="...",label="..."} 1720000000.0
-watchdiff_last_change_timestamp{url="...",label="..."} 1719999000.0
+watchdiff_last_check_timestamp_seconds{url="...",label="..."} 1720000000.0
+watchdiff_last_change_timestamp_seconds{url="...",label="..."} 1719999000.0
+watchdiff_last_http_status{url="...",label="..."} 200
 ```
 
 ```bash
@@ -628,6 +639,40 @@ The spike alert fires at most once per window to avoid repeated callbacks.
 
 ```bash
 watchdiff run https://example.com --spike-window 60 --spike-threshold 5
+```
+
+### HTTP status code monitoring
+
+Alert when the HTTP status code of a URL changes — detect outages (200→503), maintenance pages (200→503), or recoveries (503→200) independently of content changes.
+
+```python
+from watchdiff import WatchDiff, StatusChangeInfo
+
+def on_status_change(info: StatusChangeInfo) -> None:
+    print(f"[STATUS] {info.label}: {info.previous_status} → {info.current_status}")
+
+wd = WatchDiff()
+wd.watch(
+    "https://example.com",
+    interval=60,
+    alert_on_status_change=True,          # enable status change detection
+    on_status_change=on_status_change,    # optional callback
+    webhooks=["https://ntfy.sh/my-alerts"],  # webhook fires on status change too
+)
+wd.start()
+```
+
+**How it works:**
+- Status `0` means the URL is unreachable (network error, DNS failure, timeout)
+- The first check initialises the baseline — no alert is fired
+- Subsequent checks alert only when the code **changes** (e.g. 200 → 503, 503 → 200)
+- When `webhooks` are configured, a webhook is sent with `context: "http_status"` in the change payload
+- The current status is always visible in `.status()` as `last_status_code` and in the Prometheus metric `watchdiff_last_http_status`
+
+`StatusChangeInfo` fields: `url`, `label`, `previous_status`, `current_status`.
+
+```bash
+watchdiff run https://example.com --alert-on-status-change --webhook https://ntfy.sh/my-alerts
 ```
 
 ### URL comparison
@@ -821,6 +866,8 @@ Register a URL to monitor. All keyword arguments are optional. Returns `self` (c
 | `change_spike_window` | `int \| None` | `None` | Spike detection rolling window in seconds |
 | `change_spike_threshold` | `int \| None` | `None` | Alert when this many changes occur in the window |
 | `on_spike` | `Callable \| None` | `None` | Called with `SpikeInfo` when spike is detected |
+| `alert_on_status_change` | `bool` | `False` | Alert when HTTP status code changes (200→503, etc.) |
+| `on_status_change` | `Callable \| None` | `None` | Called with `StatusChangeInfo` on status code change |
 
 ```python
 # Chainable
@@ -966,6 +1013,15 @@ info.changes_in_window # int — number of changes detected in the window
 info.window_seconds    # int — the configured window size
 ```
 
+### `StatusChangeInfo`
+
+```python
+info.url             # str
+info.label           # str
+info.previous_status # int — HTTP status code before the change (0 = was unreachable)
+info.current_status  # int — HTTP status code after the change (0 = now unreachable)
+```
+
 ### `StatusServer`
 
 ```python
@@ -985,6 +1041,7 @@ Commands:
   compare   Fetch two URLs and compare their content
   check     Run a single check and print the result
   diff      Compare the last two stored snapshots for a URL
+  export    Export history or reports to CSV or XLSX
   status    Show snapshot state for all watchers in a config file
   history   Show snapshot history for a URL
   reports   Show diff reports for a URL
@@ -1009,6 +1066,10 @@ Options for run:
   --spike-window          Spike detection rolling window in seconds (0 = off)
   --spike-threshold       Number of changes to trigger a spike alert
   --status-port           Start HTTP status server on this port (0 = off)
+  --alert-on-status-change  Alert when HTTP status code changes
+  --alert-if-no-change    Fire silence alert after N seconds without change (0 = off)
+  --proxy                 Proxy URL (repeatable)
+  --user-agent            User-Agent string (repeatable)
   --webhook          -w   Webhook URL (repeatable)
   --log-format            Log format: text | json (default text)
   --verbose          -v   Enable debug logging
@@ -1032,9 +1093,16 @@ Options for diff:
   --storage          -s   Storage directory
   --json                  Output raw JSON
 
+Options for export:
+  --type                  What to export: reports | snapshots (default reports)
+  --format                Output format: csv | xlsx (default csv)
+  --output           -o   Output file path (prints to stdout if omitted)
+  --limit            -n   Max entries to export (default 500)
+
 Options for status:
   --storage          -s   Storage directory
   --config           -c   Config file to read URLs from
+  --json                  Output raw JSON
 
 Options for history / reports:
   --limit            -n   Number of entries to show (default 20)
@@ -1066,6 +1134,12 @@ Every CLI option can be set via environment variable — useful for Docker, CI, 
 | `WATCHDIFF_SPIKE_WINDOW` | `--spike-window` | `60` |
 | `WATCHDIFF_SPIKE_THRESHOLD` | `--spike-threshold` | `5` |
 | `WATCHDIFF_STATUS_PORT` | `--status-port` | `9090` |
+| `WATCHDIFF_ALERT_ON_STATUS_CHANGE` | `--alert-on-status-change` | `true` |
+| `WATCHDIFF_ALERT_IF_NO_CHANGE` | `--alert-if-no-change` | `86400` |
+| `WATCHDIFF_PROXY` | `--proxy` | `http://proxy:8080` |
+| `WATCHDIFF_USER_AGENT` | `--user-agent` | `MyBot/1.0` |
+| `WATCHDIFF_TARGET` | `--target` | `.price` |
+| `WATCHDIFF_QUIET` | `--quiet` | `true` |
 | `WATCHDIFF_LOG_FORMAT` | `--log-format` | `json` |
 | `WATCHDIFF_VERBOSE` | `--verbose` | `true` |
 

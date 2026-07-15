@@ -41,7 +41,8 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 _URL_ARG      = typer.Argument(..., help="URL to monitor.")
-_TARGET_OPT   = typer.Option(None,    "--target",   "-t", help="CSS selector or XPath to watch.")
+_TARGET_OPT   = typer.Option(None,    "--target",   "-t", help="CSS selector or XPath to watch.",
+                              envvar="WATCHDIFF_TARGET")
 _INTERVAL_OPT = typer.Option(300,     "--interval", "-i", help="Seconds between checks.",
                               envvar="WATCHDIFF_INTERVAL")
 _STORAGE_OPT  = typer.Option(".watchdiff", "--storage", "-s", help="Storage directory.",
@@ -260,6 +261,18 @@ def cmd_run(
     status_port: int        = typer.Option(0, "--status-port",
                                            help="Start status HTTP server on this port (0 = off).",
                                            envvar="WATCHDIFF_STATUS_PORT"),
+    alert_on_status_change: bool = typer.Option(False, "--alert-on-status-change",
+                                           help="Alert when HTTP status code changes.",
+                                           envvar="WATCHDIFF_ALERT_ON_STATUS_CHANGE"),
+    alert_if_no_change: int = typer.Option(0, "--alert-if-no-change",
+                                           help="Fire silence alert after N seconds without change (0 = off).",
+                                           envvar="WATCHDIFF_ALERT_IF_NO_CHANGE"),
+    proxy: list[str]      = typer.Option([], "--proxy",
+                                           help="Proxy URL (repeatable).",
+                                           envvar="WATCHDIFF_PROXY"),
+    user_agent: list[str] = typer.Option([], "--user-agent",
+                                           help="User-Agent string (repeatable).",
+                                           envvar="WATCHDIFF_USER_AGENT"),
     config_file: str | None = typer.Option(None, "--config", "-c",
                                            help="Load watchers from a JSON config file."),
 ) -> None:
@@ -299,13 +312,18 @@ def cmd_run(
         ignore_numbers         = ignore_numbers,
         archive_html           = archive_html,
         screenshot_on_change   = screenshot,
-        change_spike_window    = spike_window or None,
-        change_spike_threshold = spike_threshold or None,
+        change_spike_window      = spike_window or None,
+        change_spike_threshold   = spike_threshold or None,
+        alert_on_status_change   = alert_on_status_change,
+        alert_if_no_change_after = alert_if_no_change or None,
+        proxies                  = proxy or [],
+        user_agents              = user_agent or [],
     )
     wd.on_change(_print_report)
 
-    cooldown_label  = f"{cooldown}s" if cooldown > 0 else "off"
-    dry_run_label   = "[yellow]dry-run[/]" if dry_run else "off"
+    cooldown_label       = f"{cooldown}s" if cooldown > 0 else "off"
+    dry_run_label        = "[yellow]dry-run[/]" if dry_run else "off"
+    status_change_label  = "[yellow]on[/]" if alert_on_status_change else "off"
     status_line = ""
     if status_port > 0:
         status_line = f"\nStatus API: [cyan]http://localhost:{status_port}/status[/]"
@@ -320,7 +338,8 @@ def cmd_run(
             f"Browser:   [yellow]{browser}[/]  "
             f"Cooldown:  [yellow]{cooldown_label}[/]\n"
             f"Retries:   [yellow]{retries}[/]  "
-            f"Dry-run:   {dry_run_label}"
+            f"Dry-run:   {dry_run_label}  "
+            f"Status alerts: {status_change_label}"
             f"{status_line}\n"
             f"Press [bold]Ctrl+C[/] to stop.",
             title="WatchDiff",
@@ -480,6 +499,7 @@ def cmd_status(
     storage: str            = _STORAGE_OPT,
     config_file: str | None = typer.Option(None, "--config", "-c",
                                             help="Config file to read URLs from."),
+    output_json: bool       = typer.Option(False, "--json", help="Output raw JSON."),
 ) -> None:
     """Show last snapshot info for all watched URLs (reads from config file)."""
     from watchdiff.store import Store
@@ -512,18 +532,32 @@ def cmd_status(
     table.add_column("Last snapshot", style="green")
     table.add_column("Snapshots",     justify="right")
 
+    rows = []
     for w in watchers:
-        url_w   = w["url"]
+        url_w    = w["url"]
         target_w = w.get("target")
         label_w  = w.get("label") or url_w
         snaps    = store.load_history(url_w, target_w, limit=9999)
         latest   = snaps[-1] if snaps else None
+        rows.append({
+            "label":         label_w,
+            "url":           url_w,
+            "target":        target_w,
+            "last_snapshot": latest.captured_at.isoformat() if latest else None,
+            "snapshots":     len(snaps),
+        })
+
+    if output_json:
+        typer.echo(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+
+    for row in rows:
         table.add_row(
-            label_w,
-            url_w,
-            target_w or "full page",
-            latest.captured_at.strftime("%Y-%m-%d %H:%M:%S") if latest else "-",
-            str(len(snaps)),
+            row["label"],
+            row["url"],
+            row["target"] or "full page",
+            row["last_snapshot"][:19].replace("T", " ") if row["last_snapshot"] else "-",
+            str(row["snapshots"]),
         )
 
     console.print(table)
@@ -591,6 +625,56 @@ def cmd_reports(
                 subtitle=f"{len(changes)} change(s)",
             )
         )
+
+
+@app.command("export")
+def cmd_export(
+    url: str               = _URL_ARG,
+    target: str | None     = _TARGET_OPT,
+    storage: str           = _STORAGE_OPT,
+    output: str | None     = typer.Option(None, "--output", "-o",
+                                          help="Output file path (prints to stdout if omitted)."),
+    export_type: str       = typer.Option("reports", "--type",
+                                          help="What to export: reports | snapshots."),
+    export_format: str     = typer.Option("csv", "--format",
+                                          help="Output format: csv | xlsx."),
+    limit: int             = typer.Option(500, "--limit", "-n",
+                                          help="Max entries to export."),
+) -> None:
+    """Export snapshot history or diff reports to CSV or XLSX."""
+    from watchdiff.exporter import Exporter  # noqa: PLC0415
+    from watchdiff.store import Store        # noqa: PLC0415
+    from pathlib import Path as _Path        # noqa: PLC0415
+
+    if export_type not in ("reports", "snapshots"):
+        console.print("[red]--type must be 'reports' or 'snapshots'[/]")
+        raise typer.Exit(1)
+
+    if export_format not in ("csv", "xlsx"):
+        console.print("[red]--format must be 'csv' or 'xlsx'[/]")
+        raise typer.Exit(1)
+
+    store    = Store(storage)
+    exporter = Exporter(store)
+
+    if export_format == "csv":
+        if export_type == "reports":
+            result = exporter.reports_csv(url, target, limit=limit,
+                                          dest=_Path(output) if output else None)
+        else:
+            result = exporter.snapshots_csv(url, target, limit=limit,
+                                            dest=_Path(output) if output else None)
+        if not output:
+            typer.echo(result)
+        else:
+            console.print(f"[green]Exported[/] {export_type} to [yellow]{output}[/]")
+    else:
+        dest = _Path(output) if output else _Path(f"{export_type}.xlsx")
+        if export_type == "reports":
+            path = exporter.reports_xlsx(url, target, limit=limit, dest=dest)
+        else:
+            path = exporter.snapshots_xlsx(url, target, limit=limit, dest=dest)
+        console.print(f"[green]Exported[/] {export_type} to [yellow]{path}[/]")
 
 
 @app.command("clear")
@@ -676,6 +760,7 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
             change_threshold         = w.get("change_threshold"),
             ignore_numbers           = w.get("ignore_numbers", False),
             alert_if_no_change_after = w.get("alert_if_no_change_after"),
+            alert_on_status_change   = w.get("alert_on_status_change", False),
         )
 
     wd.on_change(on_change_cb)  # type: ignore[arg-type]

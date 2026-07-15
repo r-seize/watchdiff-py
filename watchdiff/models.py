@@ -80,6 +80,9 @@ class WatchConfig:
     change_spike_window: int | None        = None     # spike detection window in seconds
     change_spike_threshold: int | None     = None     # alert when this many changes in window
     on_spike: Callable[[SpikeInfo], None] | None = None
+    # --- new in 0.1.6 ---
+    alert_on_status_change: bool                         = False
+    on_status_change: Callable[[StatusChangeInfo], None] | None = None
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -261,3 +264,13 @@ class SpikeInfo:
     label: str
     changes_in_window: int
     window_seconds: int
+
+
+@dataclass
+class StatusChangeInfo:
+    """Payload passed to the on_status_change callback."""
+
+    url:             str
+    label:           str
+    previous_status: int
+    current_status:  int
