@@ -5,14 +5,11 @@ All tests use only stdlib — no psycopg2 / pymysql required.
 
 from __future__ import annotations
 
-import json
 import sqlite3
-import tempfile
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,13 +19,9 @@ from watchdiff.db_models import (
     ColumnDef,
     DbChangeKind,
     DbDiffMode,
-    DbDiffReport,
     DbDriver,
     DbSnapshot,
     DbWatchConfig,
-    DbWatcherStatus,
-    SchemaChangeInfo,
-    ThresholdInfo,
     db_has_changes,
     db_report_summary,
     db_snapshot_key,
@@ -514,7 +507,6 @@ class TestDbSyncScheduler:
         store.save_snapshot.assert_called_once()
 
     def test_change_fires_callback(self, tmp_path: Path) -> None:
-        from watchdiff.models import Snapshot
         from watchdiff.db_models import DbSnapshot
         from watchdiff.db_scheduler import DbSyncScheduler, _serialize
 

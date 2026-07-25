@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +281,11 @@ def db_report_summary(report: DbDiffReport) -> str:
     deleted  = sum(1 for c in report.changes if c.kind == DbChangeKind.DELETED)
     updated  = sum(1 for c in report.changes if c.kind == DbChangeKind.UPDATED)
     parts: list[str] = []
-    if inserted: parts.append(f"{inserted} inserted")
-    if deleted:  parts.append(f"{deleted} deleted")
-    if updated:  parts.append(f"{updated} updated")
+    if inserted:
+        parts.append(f"{inserted} inserted")
+    if deleted:
+        parts.append(f"{deleted} deleted")
+    if updated:
+        parts.append(f"{updated} updated")
     ts = report.compared_at.strftime("%Y-%m-%d %H:%M:%S")
     return f"[{report.label}] {', '.join(parts)} — {ts} UTC"

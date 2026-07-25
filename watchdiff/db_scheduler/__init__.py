@@ -16,7 +16,6 @@ from watchdiff.db_models import (
     DbSnapshot,
     DbWatchConfig,
     DbWatcherStatus,
-    Row,
     SchemaChangeInfo,
     ThresholdInfo,
     db_has_changes,
