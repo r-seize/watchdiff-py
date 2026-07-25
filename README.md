@@ -3,7 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/watchdiff-core?color=blue)](https://pypi.org/project/watchdiff-core/)
 [![Python versions](https://img.shields.io/pypi/pyversions/watchdiff-core)](https://pypi.org/project/watchdiff-core/)
 [![CI](https://github.com/r-seize/watchdiff-py/actions/workflows/ci.yml/badge.svg)](https://github.com/r-seize/watchdiff-py/actions/workflows/ci.yml)
-[![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0-blue)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
 
 **Lightweight web change monitoring - clean diffs, structured alerts, no AI required.**
 
@@ -36,6 +36,9 @@ No noisy HTML diffs. No external services. No AI black boxes.
 | Detect change spikes | `change_spike_window=60, change_spike_threshold=5` |
 | Alert on HTTP status change | `alert_on_status_change=True` (200→503, 503→200, etc.) |
 | Compare two different URLs | `.compare_urls(url_a, url_b)` / `watchdiff compare <urlA> <urlB>` |
+| Monitor a database table | `.watch_db("sqlite:///app.db", "orders")` |
+| DB diff mode | `diff_mode="row"` \| `"schema"` \| `"aggregate"` \| `"value"` |
+| Monitor PostgreSQL / MySQL | `"postgresql://user:pass@host/db"` / `"mysql://user:pass@host/db"` |
 | Persist to SQLite | `WatchDiff(store=SqliteStore(".watchdiff.db"))` |
 | Export history | `.export_reports_csv(url)` / `.export_reports_xlsx(url)` |
 | CLI one-liner | `watchdiff run https://example.com --target .price --interval 60` |
@@ -70,10 +73,20 @@ No noisy HTML diffs. No external services. No AI black boxes.
   - [HTTP status code monitoring](#http-status-code-monitoring)
   - [URL comparison](#url-comparison)
   - [XPath selectors](#xpath-selectors)
+  - [Database monitoring](#database-monitoring)
   - [SQLite storage backend](#sqlite-storage-backend)
   - [CSV and XLSX export](#csv-and-xlsx-export)
   - [Config file](#config-file-workflow)
 - [API reference](#api-reference)
+  - [`.watch()`](#watchurl--)
+  - [`.watch_db()`](#watch_dbconnection_string-table--)
+  - [`.start()` / `start_async()`](#startblock--startasync)
+  - [`.stop()` / pause / resume / status](#stop--pause--resume--status)
+  - [`DiffReport`](#diffreport)
+  - [`DbDiffReport`](#dbdiffreport)
+  - [`DbChange`](#dbchange)
+  - [`DbWatcherStatus`](#dbwatcherstatus)
+  - [`SchemaChangeInfo` / `ThresholdInfo`](#schemachangeinfo--thresholdinfo)
 - [CLI reference](#cli-reference)
 - [Environment variables](#environment-variables)
 - [Use cases](#use-cases)
@@ -87,6 +100,16 @@ Most change detection tools compare raw HTML — which means every minor script 
 - **Zero external services** — snapshots stored locally (JSON or SQLite)
 - **Async-ready** — sync and async schedulers included
 - **Python 3.9+** — works on Debian Bullseye, Bookworm, and Trixie
+
+## Also available for TypeScript / Node.js
+
+A TypeScript port of this library is available on npm: [watchdiff-core](https://www.npmjs.com/package/watchdiff-core)
+
+```bash
+npm install watchdiff-core
+```
+
+Same pipeline, same concepts, same diff output - native TypeScript implementation.
 
 ## Install
 
@@ -110,9 +133,20 @@ playwright install chromium
 # XLSX export
 pip install "watchdiff-core[xlsx]"
 
+# PostgreSQL monitoring
+pip install "watchdiff-core[postgres]"
+
+# MySQL monitoring
+pip install "watchdiff-core[mysql]"
+
+# PostgreSQL + MySQL
+pip install "watchdiff-core[db]"
+
 # Everything at once
 pip install "watchdiff-core[all]"
 ```
+
+> **Note:** SQLite monitoring works with zero extra dependencies — it uses Python's built-in `sqlite3` module.
 
 ## Quick start
 
@@ -132,6 +166,46 @@ wd.watch(
 )
 
 wd.start()
+```
+
+### Quick start — Database monitoring
+
+```python
+from watchdiff import WatchDiff
+
+wd = WatchDiff()
+
+# SQLite (zero extra deps)
+wd.watch_db(
+    "sqlite:///app.db",
+    "orders",
+    diff_mode="row",
+    primary_key=["id"],
+    interval=30,
+    on_change=lambda r: print(r.summary()),
+)
+
+# PostgreSQL (requires: pip install "watchdiff-core[postgres]")
+wd.watch_db(
+    "postgresql://user:pass@localhost/mydb",
+    "products",
+    diff_mode="aggregate",
+    query="SELECT COUNT(*) AS total FROM products",
+    threshold=5.0,        # alert only when row count changes by >5%
+    on_change=lambda r: print(r.summary()),
+)
+
+wd.start()
+```
+
+```bash
+# CLI — monitor a SQLite table
+watchdiff db sqlite:///app.db orders --diff-mode row --pk id --interval 30
+
+# CLI — monitor a Postgres aggregate with a threshold
+watchdiff db "postgresql://user:pass@localhost/mydb" products \
+    --diff-mode aggregate --query "SELECT COUNT(*) FROM products" \
+    --threshold 5
 ```
 
 ### CLI
@@ -717,6 +791,119 @@ wd.watch("https://example.com", target="//p[contains(@class,'intro')]")
 
 XPath is implemented via `lxml` (already a dependency — no extra install needed).
 
+### Database monitoring
+
+Monitor SQLite, PostgreSQL, and MySQL tables for row-level changes, schema changes, aggregate threshold crossings, or single-value changes.
+
+#### Diff modes
+
+| Mode | What it detects | Best for |
+|---|---|---|
+| `"row"` | Inserted / deleted / updated rows (by PK or full-row hash) | Tables with discrete records |
+| `"schema"` | Added / removed columns, type changes, nullability changes | Schema migrations |
+| `"aggregate"` | Scalar query value change by % threshold | `COUNT(*)`, `SUM(amount)`, etc. |
+| `"value"` | Any change to a single scalar value | Config tables, single-cell queries |
+
+#### Quick examples
+
+```python
+from watchdiff import WatchDiff
+
+wd = WatchDiff()
+
+# Row mode — track inserts, deletes, and updates
+wd.watch_db(
+    "sqlite:///app.db", "orders",
+    diff_mode="row",
+    primary_key=["id"],
+    interval=30,
+    alert_on_insert=True,
+    alert_on_delete=True,
+    alert_on_update=True,
+    ignore_columns=["updated_at"],   # skip timestamp columns
+    on_change=lambda r: print(r.summary()),
+)
+
+# Schema mode — alert on column additions or type changes
+wd.watch_db(
+    "postgresql://user:pass@localhost/mydb", "products",
+    diff_mode="schema",
+    on_schema_change=lambda info: print(f"Schema changed: {info.changes}"),
+)
+
+# Aggregate mode — alert when COUNT(*) changes by more than 10%
+wd.watch_db(
+    "mysql://user:pass@localhost/mydb", "events",
+    diff_mode="aggregate",
+    query="SELECT COUNT(*) AS total FROM events",
+    threshold=10.0,
+    on_threshold=lambda info: print(
+        f"Row count changed {info.change_percent:.1f}% "
+        f"({info.previous_value:.0f} → {info.current_value:.0f})"
+    ),
+)
+
+# Value mode — alert when a config value changes
+wd.watch_db(
+    "sqlite:///settings.db", "config",
+    diff_mode="value",
+    query="SELECT value FROM config WHERE key = 'feature_flag'",
+    on_change=lambda r: print(r.summary()),
+)
+
+wd.start()
+```
+
+#### Callbacks
+
+| Callback | Type | When fired |
+|---|---|---|
+| `on_change` | `Callable[[DbDiffReport], None]` | Any change in any mode |
+| `on_schema_change` | `Callable[[SchemaChangeInfo], None]` | Schema change detected (schema mode) |
+| `on_threshold` | `Callable[[ThresholdInfo], None]` | Aggregate threshold exceeded |
+| `on_error` | `Callable[[Exception, DbWatchConfig], None]` | Fetch or diff error |
+
+#### Async support
+
+```python
+import asyncio
+from watchdiff import WatchDiff
+
+async def main():
+    wd = WatchDiff()
+    wd.watch_db("sqlite:///app.db", "orders", primary_key=["id"],
+                on_change=lambda r: print(r.summary()))
+    await wd.start_async()
+
+asyncio.run(main())
+```
+
+#### CLI
+
+```bash
+# Row mode with PK
+watchdiff db sqlite:///app.db orders --diff-mode row --pk id --interval 30
+
+# Schema change monitoring
+watchdiff db "postgresql://user:pass@localhost/mydb" products --diff-mode schema
+
+# Aggregate with threshold (alert when >5% change)
+watchdiff db "mysql://user:pass@localhost/mydb" events \
+    --diff-mode aggregate \
+    --query "SELECT COUNT(*) FROM events" \
+    --threshold 5.0
+
+# Ignore columns, webhook alerts
+watchdiff db sqlite:///app.db orders \
+    --pk id \
+    --ignore-column updated_at \
+    --ignore-column created_at \
+    --webhook https://discord.com/api/webhooks/...
+
+# Output as JSON
+watchdiff db sqlite:///app.db orders --pk id --json
+```
+
 ### SQLite storage backend
 
 By default, WatchDiff stores snapshots as JSON files. For larger datasets or concurrent access, use the built-in SQLite backend — no extra dependencies required:
@@ -877,6 +1064,45 @@ wd.watch("https://site.com/product", target=".price", interval=300) \
   .start()
 ```
 
+#### `.watch_db(connection_string, table, *, ...)`
+
+Register a database table to monitor. Returns `self` (chainable).
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `connection_string` | `str` | — | `"sqlite:///app.db"`, `"postgresql://user:pass@host/db"`, `"mysql://user:pass@host/db"` |
+| `table` | `str` | — | Table name to watch |
+| `diff_mode` | `str` | `"row"` | `"row"` \| `"schema"` \| `"aggregate"` \| `"value"` |
+| `interval` | `int` | `300` | Seconds between checks |
+| `label` | `str \| None` | `table` | Human-readable name shown in logs |
+| `query` | `str \| None` | `None` | Custom SQL; overrides default `SELECT * FROM <table>` |
+| `primary_key` | `list[str] \| None` | `None` | Columns used as row identity in `row` mode |
+| `ignore_columns` | `list[str] \| None` | `None` | Columns excluded from row comparison |
+| `alert_on_insert` | `bool` | `True` | Fire alert when rows are inserted |
+| `alert_on_delete` | `bool` | `True` | Fire alert when rows are deleted |
+| `alert_on_update` | `bool` | `True` | Fire alert when rows are updated |
+| `threshold` | `float \| None` | `None` | Minimum % change to alert in `aggregate` mode (0 = any change) |
+| `cooldown` | `float` | `0.0` | Min seconds between two alerts (0 = disabled) |
+| `dry_run` | `bool` | `False` | Fetch+diff without saving or dispatching alerts |
+| `max_snapshots` | `int \| None` | `None` | Prune history to this many entries after each save |
+| `webhooks` | `list[str]` | `[]` | Webhook URLs to POST on change |
+| `webhook_retries` | `int` | `3` | Retry attempts per webhook |
+| `on_change` | `Callable[[DbDiffReport], None] \| None` | `None` | Called with `DbDiffReport` on any change |
+| `on_schema_change` | `Callable[[SchemaChangeInfo], None] \| None` | `None` | Called when a schema change is detected |
+| `on_threshold` | `Callable[[ThresholdInfo], None] \| None` | `None` | Called when aggregate threshold is exceeded |
+| `on_error` | `Callable[[Exception, DbWatchConfig], None] \| None` | `None` | Called with `(exc, config)` on error |
+
+```python
+from watchdiff import WatchDiff
+
+wd = WatchDiff()
+wd.watch_db("sqlite:///app.db", "orders",
+            diff_mode="row", primary_key=["id"], interval=30,
+            ignore_columns=["updated_at"],
+            on_change=lambda r: print(r.summary()))
+wd.start()
+```
+
 #### `.on_change(callback)`
 
 Register a global callback called whenever any watched URL changes:
@@ -890,7 +1116,7 @@ def handle(report):
 wd.on_change(handle)
 ```
 
-#### `.start(block=True)` / `await .start_async()`
+#### `.start(block=True)` / `await .start_async()` / `.stop()`
 
 Start the synchronous scheduler. Blocks until `Ctrl+C` by default. Pass `block=False` to run in daemon threads and keep control of the main thread.
 
@@ -905,6 +1131,14 @@ async def main():
     await wd.start_async()
 
 asyncio.run(main())
+```
+
+Call `.stop()` to stop all running schedulers (URL watchers and DB watchers) when running with `block=False`:
+
+```python
+wd.start(block=False)
+# ... do other work ...
+wd.stop()
 ```
 
 #### `.check_once(url)`
@@ -955,16 +1189,22 @@ wd.start_status_server(port=9090, host="127.0.0.1")
 wd.stop_status_server()
 ```
 
-#### `.pause(url)` / `.resume(url)` / `.status()`
+#### `.pause(url)` / `.resume(url)` / `.status()` / `.db_status()`
 
 Control watchers and inspect their state after `start(block=False)`:
 
 ```python
 wd.start(block=False)
+
+# URL watchers
 wd.pause("https://example.com")
 wd.resume("https://example.com")
 for s in wd.status():
     print(s.label, s.checks_count, s.changes_count, s.errors_count, s.paused)
+
+# DB watchers
+for s in wd.db_status():
+    print(s.table, s.diff_mode, s.checks_count, s.changes_count, s.errors_count)
 ```
 
 #### `.history(url)` / `.reports(url)` / `.clear(url)`
@@ -1032,12 +1272,111 @@ server.start()
 server.stop()
 ```
 
+### `DbDiffReport`
+
+Returned by `on_change` and `DbDiffEngine.compare()`:
+
+```python
+report.connection_string  # str — DB connection string
+report.table              # str — table name
+report.label              # str — human-readable label
+report.diff_mode          # DbDiffMode — mode used for comparison
+report.changes            # list[DbChange] — all detected changes
+report.before             # DbSnapshot — snapshot before
+report.after              # DbSnapshot — snapshot after
+report.compared_at        # datetime — UTC timestamp of comparison
+
+report.has_changes        # bool — True if any changes were detected
+report.summary()          # str — e.g. "orders: 2 inserted, 1 deleted"
+report.as_dict()          # JSON-serialisable dict
+```
+
+### `DbChange`
+
+Individual change within a `DbDiffReport`:
+
+```python
+change.kind          # DbChangeKind — see values below
+change.row           # dict | None — full row (inserted/deleted)
+change.row_key       # str | None — serialised PK value
+change.modifications # list[RowModification] | None — updated fields
+change.column        # str | None — column name (schema mode)
+change.before        # Any — value/type before
+change.after         # Any — value/type after
+change.context       # str | None — human hint (e.g. "column added")
+```
+
+`DbChangeKind` values: `"inserted"`, `"deleted"`, `"updated"`, `"schema_changed"`, `"threshold_exceeded"`, `"value_changed"`.
+
+`RowModification` fields: `column` (str), `before` (Any), `after` (Any).
+
+### `DbWatcherStatus`
+
+Returned by `.db_status()`:
+
+```python
+from watchdiff import DbWatcherStatus
+
+status.connection_string  # str
+status.table              # str
+status.label              # str
+status.diff_mode          # str — "row", "schema", "aggregate", or "value"
+status.interval           # int — seconds between checks
+status.paused             # bool
+status.last_check_at      # datetime | None
+status.next_check_at      # datetime | None
+status.last_change_at     # datetime | None
+status.checks_count       # int
+status.changes_count      # int
+status.errors_count       # int
+
+status.as_dict()          # JSON-serialisable dict
+```
+
+### `SchemaChangeInfo` / `ThresholdInfo`
+
+Passed to `on_schema_change` and `on_threshold` callbacks respectively:
+
+```python
+# SchemaChangeInfo — from on_schema_change
+info.connection_string  # str
+info.table              # str
+info.label              # str
+info.changes            # list[DbChange] — schema-related changes only
+
+# ThresholdInfo — from on_threshold
+info.connection_string  # str
+info.table              # str
+info.label              # str
+info.previous_value     # float — scalar value before
+info.current_value      # float — scalar value after
+info.change_percent     # float — percentage change (absolute)
+info.threshold          # float — configured threshold
+```
+
+### DB helper functions
+
+```python
+from watchdiff import (
+    make_db_watch_config,  # build a DbWatchConfig from kwargs
+    db_snapshot_key,       # stable store key for a (connection, table) pair
+    db_has_changes,        # bool — True if a DbDiffReport has any changes
+    db_report_summary,     # str — human-readable summary of a DbDiffReport
+)
+
+key     = db_snapshot_key("sqlite:///app.db", "orders")   # "db::a3f1c2::orders"
+cfg     = make_db_watch_config("sqlite:///app.db", "orders", diff_mode="row")
+has     = db_has_changes(report)    # True | False
+summary = db_report_summary(report) # "orders: 1 inserted"
+```
+
 ## CLI reference
 
 ```
 Commands:
   init      Generate a watchdiff.config.json template
   run       Start continuous monitoring (URL or config file)
+  db        Monitor a database table for changes
   compare   Fetch two URLs and compare their content
   check     Run a single check and print the result
   diff      Compare the last two stored snapshots for a URL
@@ -1074,6 +1413,22 @@ Options for run:
   --log-format            Log format: text | json (default text)
   --verbose          -v   Enable debug logging
   --quiet            -q   Suppress change output
+
+Options for db:
+  --diff-mode        -m   row | schema | aggregate | value (default row)
+  --interval         -i   Seconds between checks (default 60)
+  --label                 Human-readable name for logs
+  --query            -q   Custom SQL query (overrides default SELECT *)
+  --pk                    Primary key column (repeatable)
+  --ignore-column         Column to exclude from diff (repeatable)
+  --threshold             Aggregate % threshold to trigger alert (0 = off)
+  --cooldown              Min seconds between alerts (0 = off)
+  --dry-run               Fetch+diff without saving or alerting
+  --max-snapshots         Max snapshots to keep (0 = unlimited)
+  --webhook          -w   Webhook URL (repeatable)
+  --storage          -s   Storage directory
+  --json                  Output change reports as JSON
+  --verbose          -v   Enable debug logging
 
 Options for compare:
   --target           -t   CSS selector or XPath
@@ -1142,6 +1497,10 @@ Every CLI option can be set via environment variable — useful for Docker, CI, 
 | `WATCHDIFF_QUIET` | `--quiet` | `true` |
 | `WATCHDIFF_LOG_FORMAT` | `--log-format` | `json` |
 | `WATCHDIFF_VERBOSE` | `--verbose` | `true` |
+| `WATCHDIFF_DB_INTERVAL` | `watchdiff db --interval` | `30` |
+| `WATCHDIFF_DB_DIFF_MODE` | `watchdiff db --diff-mode` | `row` |
+| `WATCHDIFF_DB_THRESHOLD` | `watchdiff db --threshold` | `5.0` |
+| `WATCHDIFF_DB_COOLDOWN` | `watchdiff db --cooldown` | `300` |
 
 ```dockerfile
 # Docker example
@@ -1153,6 +1512,7 @@ CMD ["watchdiff", "run", "--config", "/app/watchdiff.config.json"]
 
 ## Use cases
 
+- **Database monitoring** — detect row inserts/deletes/updates, schema migrations, or count threshold crossings
 - **E-commerce** — track product prices, stock levels, and shipping estimates
 - **News monitoring** — detect article updates or new publications on a live feed
 - **RSS feeds** — get item-level alerts on new or changed entries with `diff_mode="rss"`
@@ -1171,7 +1531,6 @@ Missing a feature? Found a bug? Pull requests are welcome on [GitHub](https://gi
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+This project is licensed under the [BSD 2-Clause License](LICENSE).
 
-You are free to use, study, modify, and distribute this software under the terms of the GPL v3.
-Any derivative work must also be distributed under the same license.
+Copyright (c) 2026, WatchDiff Contributors. Free to use in open-source and commercial projects.

@@ -51,6 +51,8 @@ from watchdiff.store import Store
 
 logger = logging.getLogger(__name__)
 
+_UNSET = object()
+
 
 class WatchDiff:
     """
@@ -72,9 +74,12 @@ class WatchDiff:
         """
         self._store: Any                                           = store if store is not None else Store(storage_dir)
         self._configs: list[WatchConfig]                           = []
+        self._db_configs: list[Any]                                = []
         self._global_callbacks: list[Callable[[DiffReport], None]] = []
         self._scheduler: SyncScheduler | None                      = None
         self._async_scheduler: AsyncScheduler | None               = None
+        self._db_scheduler: Any | None                             = None
+        self._async_db_scheduler: Any | None                       = None
         self._status_server: Any | None                            = None
 
     # ------------------------------------------------------------------
@@ -220,6 +225,88 @@ class WatchDiff:
         self._global_callbacks.append(callback)
         return self
 
+    def watch_db(
+        self,
+        connection_string: str,
+        table: str,
+        *,
+        diff_mode: str                                    = "row",
+        interval: int                                     = 60,
+        label: str | None                                 = None,
+        query: str | None                                 = None,
+        primary_key: list[str] | None                     = None,
+        ignore_columns: list[str] | None                  = None,
+        alert_on_insert: bool                             = True,
+        alert_on_delete: bool                             = True,
+        alert_on_update: bool                             = True,
+        threshold: float | None                           = None,
+        cooldown: float                                   = 0.0,
+        dry_run: bool                                     = False,
+        max_snapshots: int | None                         = None,
+        webhooks: list[str] | None                        = None,
+        webhook_retries: int                              = 3,
+        on_change: Callable[[Any], None] | None           = None,
+        on_schema_change: Callable[[Any], None] | None    = None,
+        on_threshold: Callable[[Any], None] | None        = None,
+        on_error: Callable[[Exception, Any], None] | None = None,
+    ) -> WatchDiff:
+        """
+        Register a database table to monitor.
+
+        Args:
+            connection_string: DB URL: ``sqlite:///app.db``, ``postgresql://user:pass@host/db``,
+                               or ``mysql://user:pass@host/db``.
+            table:             Table name to watch (also used in ``query`` placeholder).
+            diff_mode:         ``"row"`` | ``"schema"`` | ``"aggregate"`` | ``"value"``.
+            interval:          Seconds between checks (default 60).
+            label:             Human-readable name shown in logs and reports.
+            query:             Custom SQL query; overrides the default ``SELECT * FROM <table>``.
+            primary_key:       Column(s) used as row identity in ``row`` mode.
+            ignore_columns:    Columns to exclude from row comparison.
+            alert_on_insert:   Fire alert when rows are inserted (default True).
+            alert_on_delete:   Fire alert when rows are deleted (default True).
+            alert_on_update:   Fire alert when rows are updated (default True).
+            threshold:         Minimum % change to alert in ``aggregate`` mode (0 = any change).
+            cooldown:          Min seconds between two alerts (0 = disabled).
+            dry_run:           Fetch+diff without saving or dispatching alerts.
+            max_snapshots:     Prune history to this many entries after each save.
+            webhooks:          Webhook URLs to POST on change.
+            webhook_retries:   Number of retry attempts per webhook.
+            on_change:         Callback receiving a ``DbDiffReport`` on each change.
+            on_schema_change:  Callback receiving a ``SchemaChangeInfo`` on schema change.
+            on_threshold:      Callback receiving a ``ThresholdInfo`` when threshold exceeded.
+            on_error:          Callback receiving ``(exc, config)`` on fetch/diff error.
+
+        Returns:
+            self (chainable)
+        """
+        from watchdiff.db_models import make_db_watch_config  # noqa: PLC0415
+        config = make_db_watch_config(
+            connection_string,
+            table,
+            diff_mode       = diff_mode,
+            interval        = interval,
+            label           = label,
+            query           = query,
+            primary_key     = primary_key,
+            ignore_columns  = ignore_columns,
+            alert_on_insert = alert_on_insert,
+            alert_on_delete = alert_on_delete,
+            alert_on_update = alert_on_update,
+            threshold       = threshold,
+            cooldown        = cooldown,
+            dry_run         = dry_run,
+            max_snapshots   = max_snapshots,
+            webhooks        = webhooks or [],
+            webhook_retries = webhook_retries,
+            on_change       = on_change,
+            on_schema_change = on_schema_change,
+            on_threshold    = on_threshold,
+            on_error        = on_error,
+        )
+        self._db_configs.append(config)
+        return self
+
     # ------------------------------------------------------------------
     # Run API
     # ------------------------------------------------------------------
@@ -232,33 +319,77 @@ class WatchDiff:
             block: If True (default), blocks until Ctrl+C.
                    If False, returns immediately (threads run as daemons).
         """
-        if not self._configs:
-            logger.warning("No URLs registered. Call .watch() first.")
+        import time  # noqa: PLC0415
+
+        has_urls = bool(self._configs)
+        has_db   = bool(self._db_configs)
+
+        if not has_urls and not has_db:
+            logger.warning("Nothing registered. Call .watch() or .watch_db() first.")
             return
 
-        scheduler = SyncScheduler(self._store)
-        self._scheduler = scheduler
-        for cb in self._global_callbacks:
-            scheduler.add_global_callback(cb)
+        if has_urls:
+            scheduler = SyncScheduler(self._store)
+            self._scheduler = scheduler
+            for cb in self._global_callbacks:
+                scheduler.add_global_callback(cb)
+            scheduler.start(self._configs, block=False)
 
-        scheduler.start(self._configs, block=block)
+        if has_db:
+            from watchdiff.db_scheduler import DbSyncScheduler  # noqa: PLC0415
+            db_scheduler = DbSyncScheduler(self._store)
+            self._db_scheduler = db_scheduler
+            db_scheduler.start(self._db_configs, block=False)
+
+        if block:
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                self.stop()
 
     async def start_async(self) -> None:
         """
         Start the async scheduler.
 
-        Use with `asyncio.run(wd.start_async())` or inside an existing event loop.
+        Use with ``asyncio.run(wd.start_async())`` or inside an existing event loop.
         """
-        if not self._configs:
-            logger.warning("No URLs registered. Call .watch() first.")
+        has_urls = bool(self._configs)
+        has_db   = bool(self._db_configs)
+
+        if not has_urls and not has_db:
+            logger.warning("Nothing registered. Call .watch() or .watch_db() first.")
             return
 
-        scheduler = AsyncScheduler(self._store)
-        self._async_scheduler = scheduler
-        for cb in self._global_callbacks:
-            scheduler.add_global_callback(cb)
+        coros = []
 
-        await scheduler.start(self._configs)
+        if has_urls:
+            scheduler = AsyncScheduler(self._store)
+            self._async_scheduler = scheduler
+            for cb in self._global_callbacks:
+                scheduler.add_global_callback(cb)
+            coros.append(scheduler.start(self._configs))
+
+        if has_db:
+            from watchdiff.db_scheduler import DbAsyncScheduler  # noqa: PLC0415
+            db_scheduler = DbAsyncScheduler(self._store)
+            self._async_db_scheduler = db_scheduler
+            coros.append(db_scheduler.start(self._db_configs))
+
+        if len(coros) == 1:
+            await coros[0]
+        else:
+            import asyncio  # noqa: PLC0415
+            await asyncio.gather(*coros, return_exceptions=True)
+
+    def stop(self) -> None:
+        """Stop all running schedulers."""
+        if self._scheduler:
+            self._scheduler.stop()
+        if self._db_scheduler:
+            self._db_scheduler.stop()
+        if self._async_db_scheduler:
+            self._async_db_scheduler.stop()
 
     def check_once(self, url: str) -> DiffReport | None:
         """
@@ -323,6 +454,16 @@ class WatchDiff:
         if self._scheduler is None:
             return []
         return self._scheduler.status()
+
+    def db_status(self) -> list[Any]:
+        """
+        Return live status for all registered DB watchers as ``DbWatcherStatus`` objects.
+
+        Returns an empty list if the DB scheduler has not been started.
+        """
+        if self._db_scheduler is None:
+            return []
+        return self._db_scheduler.get_statuses()
 
     # ------------------------------------------------------------------
     # History / audit API

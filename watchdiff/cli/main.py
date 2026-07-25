@@ -677,6 +677,83 @@ def cmd_export(
         console.print(f"[green]Exported[/] {export_type} to [yellow]{path}[/]")
 
 
+@app.command("db")
+def cmd_db(
+    connection_string: str       = typer.Argument(..., help="DB connection string (sqlite:///app.db, postgresql://..., mysql://...)."),
+    table: str                   = typer.Argument(..., help="Table name to monitor."),
+    diff_mode: str               = typer.Option("row",  "--diff-mode", "-m",
+                                                help="Diff mode: row | schema | aggregate | value.",
+                                                envvar="WATCHDIFF_DB_DIFF_MODE"),
+    interval: int                = typer.Option(60,     "--interval",  "-i",
+                                                help="Seconds between checks.",
+                                                envvar="WATCHDIFF_DB_INTERVAL"),
+    label: str | None            = typer.Option(None,   "--label",     help="Human-readable name."),
+    query: str | None            = typer.Option(None,   "--query",     "-q",
+                                                help="Custom SQL query (overrides default SELECT *)."),
+    primary_key: list[str]       = typer.Option([],     "--pk",
+                                                help="Primary key column (repeatable)."),
+    ignore_column: list[str]     = typer.Option([],     "--ignore-column",
+                                                help="Column to exclude from diff (repeatable)."),
+    threshold: float             = typer.Option(0.0,    "--threshold",
+                                                help="Aggregate % threshold to trigger alert (0 = off).",
+                                                envvar="WATCHDIFF_DB_THRESHOLD"),
+    cooldown: float              = typer.Option(0.0,    "--cooldown",
+                                                help="Min seconds between alerts (0 = off).",
+                                                envvar="WATCHDIFF_DB_COOLDOWN"),
+    dry_run: bool                = typer.Option(False,  "--dry-run",
+                                                help="Fetch+diff without saving or alerting.",
+                                                envvar="WATCHDIFF_DRY_RUN"),
+    max_snapshots: int           = typer.Option(0,      "--max-snapshots",
+                                                help="Max snapshots to keep (0 = unlimited).",
+                                                envvar="WATCHDIFF_MAX_SNAPSHOTS"),
+    webhook: list[str]           = typer.Option([],     "--webhook", "-w",
+                                                help="Webhook URL (repeatable).",
+                                                envvar="WATCHDIFF_WEBHOOK"),
+    storage: str                 = _STORAGE_OPT,
+    verbose: bool                = _VERBOSE_OPT,
+    output_json: bool            = typer.Option(False, "--json", help="Output change reports as JSON."),
+) -> None:
+    """Monitor a database table for changes."""
+    _setup_logging(verbose)
+
+    def _print_db_report(report: object) -> None:  # report: DbDiffReport
+        if output_json:
+            typer.echo(json.dumps(report.as_dict(), indent=2, ensure_ascii=False))  # type: ignore[attr-defined]
+        else:
+            _render_db_report(report)
+
+    wd = WatchDiff(storage_dir=storage)
+    wd.watch_db(
+        connection_string,
+        table,
+        diff_mode       = diff_mode,
+        interval        = interval,
+        label           = label,
+        query           = query,
+        primary_key     = primary_key or None,
+        ignore_columns  = ignore_column or None,
+        threshold       = threshold or None,
+        cooldown        = cooldown,
+        dry_run         = dry_run,
+        max_snapshots   = max_snapshots or None,
+        webhooks        = webhook or [],
+        on_change       = _print_db_report,
+    )
+
+    dry_run_label = "[yellow]dry-run[/]" if dry_run else "off"
+    console.print(
+        Panel(
+            f"[bold cyan]WatchDiff DB[/] monitoring [green]{table}[/]\n"
+            f"Connection: [yellow]{connection_string}[/]\n"
+            f"Mode: [yellow]{diff_mode}[/]  Interval: [yellow]{interval}s[/]  "
+            f"Dry-run: {dry_run_label}\n"
+            f"Press [bold]Ctrl+C[/] to stop.",
+            title="WatchDiff DB",
+        )
+    )
+    wd.start(block=True)
+
+
 @app.command("clear")
 def cmd_clear(
     url: str           = _URL_ARG,
@@ -775,6 +852,38 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
         )
     )
     wd.start(block=True)
+
+
+def _render_db_report(report: object) -> None:
+    lines = []
+    try:
+        summary = report.summary()  # type: ignore[attr-defined]
+        changes = report.changes    # type: ignore[attr-defined]
+    except AttributeError:
+        console.print(str(report))
+        return
+
+    lines.append(f"[bold]{summary}[/]\n")
+    for change in changes[:20]:
+        kind = change.kind.value
+        if kind == "inserted":
+            lines.append(f"  [green][+][/] {change.row}")
+        elif kind == "deleted":
+            lines.append(f"  [red][-][/] {change.row}")
+        elif kind == "updated":
+            mods = ", ".join(
+                f"{m.column}: {m.before!r} → {m.after!r}"
+                for m in (change.modifications or [])
+            )
+            lines.append(f"  [yellow][~][/] row {change.row_key}: {mods}")
+        elif kind == "schema_changed":
+            lines.append(f"  [cyan][S][/] {change.column}: {change.context}")
+        elif kind == "threshold_exceeded":
+            lines.append(f"  [magenta][T][/] {change.context}")
+        elif kind == "value_changed":
+            lines.append(f"  [yellow][V][/] {change.before!r} → {change.after!r}")
+
+    console.print(Panel("\n".join(lines), title="DB Changes", border_style="yellow"))
 
 
 def _render_report(report: DiffReport) -> None:
