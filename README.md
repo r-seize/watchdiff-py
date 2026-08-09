@@ -5,10 +5,9 @@
 [![CI](https://github.com/r-seize/watchdiff-py/actions/workflows/ci.yml/badge.svg)](https://github.com/r-seize/watchdiff-py/actions/workflows/ci.yml)
 [![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
 
-**Lightweight web change monitoring - clean diffs, structured alerts, no AI required.**
+**Lightweight web change monitoring - clean diffs, AI summaries, file/API/SSL monitoring, structured alerts.**
 
-WatchDiff watches web pages and tells you **exactly what changed**, in plain language.
-No noisy HTML diffs. No external services. No AI black boxes.
+WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then tells you exactly what changed, in plain language or via an AI-generated summary.
 
 ## At a glance
 
@@ -1118,6 +1117,82 @@ except AiError as e:
     print(e.is_retryable)  # True  - retry next check
     print(e.is_permanent)  # False - don't disable
     print(e.status_code)   # 429
+```
+
+## File monitoring
+
+Watch local files or config files for changes using the same diff pipeline as URL monitoring.
+
+```python
+wd.watch_file("/etc/nginx/nginx.conf", interval=30, diff_mode="line",
+              on_change=lambda r: print("Config changed:", r.changes))
+
+wd.watch_file("/var/log/app.log", interval=5,
+              alert_if=lambda r: any("ERROR" in (c.after or "") for c in r.changes))
+
+# With AI summary
+wd.watch_file("/tmp/prices.txt", interval=2, ai_summary=True,
+              on_change=lambda r: print(r.ai_summary))
+```
+
+## API monitoring
+
+`watch_api()` is a convenience wrapper over `watch()` that defaults to JSON diff mode and tracks response time by default.
+
+```python
+wd.watch_api("https://api.example.com/v1/prices",
+             interval=60,
+             expected_status=200,
+             on_change=lambda r: print(f"Response time: {r.response_time_ms:.0f}ms, diff: {r.changes}"))
+```
+
+`report.response_time_ms` is populated on every check (enabled by default on `watch_api()`).
+
+## SSL certificate monitoring
+
+Alert before a certificate expires or when it is silently replaced (renewal, infrastructure change).
+
+```python
+wd.watch_cert("example.com",
+              warn_days_before_expiry=30,
+              alert_on_expiry=True,
+              alert_on_change=True,
+              webhooks=["https://discord.com/api/webhooks/..."],
+              on_expiry=lambda i: print(f"{i.hostname} expires in {i.days_until_expiry} days"),
+              on_change=lambda i: print(f"Cert replaced - new expiry {i.current_valid_to}"))
+
+# Check status
+print(wd.get_cert_statuses())
+# [CertWatcherStatus(hostname="example.com", days_until_expiry=12, is_expiring_soon=True, ...)]
+```
+
+Default options: `port=443`, `interval=86400` (24h), `warn_days_before_expiry=30`.
+
+## Condition-based alerts - alert_if
+
+Suppress alerts unless a custom condition is met. `alert_if` is evaluated after diffing and before dispatching webhooks/callbacks - avoids noisy alerts without sacrificing monitoring coverage.
+
+```python
+# Only alert when the price drops below a threshold
+wd.watch("https://shop.example.com/product", target=".price",
+         alert_if=lambda r: any(
+             float((c.after or "0").replace(",", ".").strip("€$ ")) < 25
+             for c in r.changes if c.after
+         ))
+
+# Only alert on critical log lines
+wd.watch_file("/var/log/app.log",
+              alert_if=lambda r: any(
+                  ("CRITICAL" in (c.after or "") or "FATAL" in (c.after or ""))
+                  for c in r.changes
+              ))
+
+# Only alert when a JSON API field exceeds a threshold
+wd.watch_api("https://api.example.com/stats",
+             alert_if=lambda r: any(
+                 c.context == "errorRate" and float(c.after or 0) > 5
+                 for c in r.changes
+             ))
 ```
 
 ## API reference
