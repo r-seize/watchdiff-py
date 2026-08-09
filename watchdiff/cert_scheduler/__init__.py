@@ -16,7 +16,6 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any
 
 from watchdiff.cert_fetcher import fetch_cert
 from watchdiff.cert_models import (

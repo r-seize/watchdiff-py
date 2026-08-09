@@ -32,7 +32,7 @@ from typing import Any, Callable
 
 from pathlib import Path
 
-from watchdiff.ai_summarizer import AiError, call_provider, generate_ai_summary, get_provider
+from watchdiff.ai_summarizer import AiError, generate_ai_summary, get_provider
 from watchdiff.cleaner import Cleaner
 from watchdiff.diff import DiffEngine
 from watchdiff.fetcher import AsyncFetcher, Fetcher
