@@ -83,6 +83,14 @@ class WatchConfig:
     # --- new in 0.1.6 ---
     alert_on_status_change: bool                         = False
     on_status_change: Callable[[StatusChangeInfo], None] | None = None
+    # --- new in 0.2.1 ---
+    is_file:              bool                           = False    # set by watch_file() - use FileFetcher
+    expected_status:      int | None                     = None     # alert when HTTP status != this value
+    track_response_time:  bool                           = False    # record response_time_ms in DiffReport
+    alert_if:             Callable[[DiffReport], bool] | None = None  # custom alert condition gate
+    ai_summary:           bool                           = False    # generate AI summary of changes
+    ai_provider:          Any | None                     = None     # AiProvider instance
+    ai_prompt:            str | Callable[[DiffReport], str] | None = None  # custom prompt override
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -157,8 +165,10 @@ class DiffReport:
     label: str
     before: Snapshot
     after: Snapshot
-    changes: list[Change]  = field(default_factory=list)
-    compared_at: datetime  = field(default_factory=lambda: datetime.now(timezone.utc))
+    changes: list[Change]         = field(default_factory=list)
+    compared_at: datetime         = field(default_factory=lambda: datetime.now(timezone.utc))
+    ai_summary: str | None        = None   # populated when ai_summary=True on config
+    response_time_ms: float | None = None  # populated when track_response_time=True
 
     @property
     def has_changes(self) -> bool:

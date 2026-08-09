@@ -1,0 +1,16 @@
+[
+  {
+    "url": "file:///tmp/wd_py_alertif.txt",
+    "target": null,
+    "label": "AlertIfTest",
+    "compared_at": "2026-08-08T19:49:03.534050+00:00",
+    "changes": [
+      {
+        "kind": "modified",
+        "before": "normal update without keyword",
+        "after": "ERROR: something broke",
+        "context": "ERROR: something broke"
+      }
+    ]
+  }
+]

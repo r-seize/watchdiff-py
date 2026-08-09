@@ -1,0 +1,34 @@
+[
+  {
+    "url": "file:///tmp/wd_py_test.txt",
+    "target": null,
+    "content": "initial content",
+    "raw_html": "initial content",
+    "captured_at": "2026-08-08T19:48:43.933624+00:00",
+    "checksum": "916a3f0bc3a428e1a168f4408df82cd5bbb8b08c6d7ac55eff9dff29825134df"
+  },
+  {
+    "url": "file:///tmp/wd_py_test.txt",
+    "target": null,
+    "content": "initial content",
+    "raw_html": "initial content",
+    "captured_at": "2026-08-08T19:48:45.938788+00:00",
+    "checksum": "916a3f0bc3a428e1a168f4408df82cd5bbb8b08c6d7ac55eff9dff29825134df"
+  },
+  {
+    "url": "file:///tmp/wd_py_test.txt",
+    "target": null,
+    "content": "modified content at t=3s",
+    "raw_html": "modified content at t=3s",
+    "captured_at": "2026-08-08T19:48:47.940422+00:00",
+    "checksum": "15a71a895cdab1d71d4437523d88130b25e3261e7f3996b563ef724a1928474b"
+  },
+  {
+    "url": "file:///tmp/wd_py_test.txt",
+    "target": null,
+    "content": "modified content at t=3s",
+    "raw_html": "modified content at t=3s",
+    "captured_at": "2026-08-08T19:48:49.942368+00:00",
+    "checksum": "15a71a895cdab1d71d4437523d88130b25e3261e7f3996b563ef724a1928474b"
+  }
+]

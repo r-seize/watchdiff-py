@@ -78,6 +78,9 @@ class DbWatchConfig:
     on_error:          Callable[[Exception, DbWatchConfig], None] | None  = None
     on_schema_change:  Callable[[SchemaChangeInfo], None] | None          = None
     on_threshold:      Callable[[ThresholdInfo], None] | None             = None
+    # --- new in 0.2.1 ---
+    ai_summary:        bool                                                = False
+    ai_provider:       Any | None                                          = None
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -168,7 +171,8 @@ class DbDiffReport:
     after:             DbSnapshot
     changes:           list[DbChange]
     diff_mode:         DbDiffMode
-    compared_at:       datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    compared_at:       datetime    = field(default_factory=lambda: datetime.now(timezone.utc))
+    ai_summary:        str | None  = None
 
     @property
     def has_changes(self) -> bool:
@@ -288,4 +292,4 @@ def db_report_summary(report: DbDiffReport) -> str:
     if updated:
         parts.append(f"{updated} updated")
     ts = report.compared_at.strftime("%Y-%m-%d %H:%M:%S")
-    return f"[{report.label}] {', '.join(parts)} — {ts} UTC"
+    return f"[{report.label}] {', '.join(parts)} - {ts} UTC"

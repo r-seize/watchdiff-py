@@ -1,0 +1,16 @@
+[
+  {
+    "url": "file:///tmp/wd_py_test.txt",
+    "target": null,
+    "label": "FileTest",
+    "compared_at": "2026-08-08T19:48:47.940838+00:00",
+    "changes": [
+      {
+        "kind": "modified",
+        "before": "initial content",
+        "after": "modified content at t=3s",
+        "context": "modified content at t=3s"
+      }
+    ]
+  }
+]

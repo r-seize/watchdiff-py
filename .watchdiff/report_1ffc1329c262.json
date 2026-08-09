@@ -1,0 +1,16 @@
+[
+  {
+    "url": "file:///tmp/wd_py_ai.txt",
+    "target": null,
+    "label": "AiTest",
+    "compared_at": "2026-08-08T19:50:30.730503+00:00",
+    "changes": [
+      {
+        "kind": "modified",
+        "before": "initial content for AI test",
+        "after": "The price dropped from 100 euros to 75 euros on the main page.",
+        "context": "The price dropped from 100 euros to 75 euros on the main page."
+      }
+    ]
+  }
+]

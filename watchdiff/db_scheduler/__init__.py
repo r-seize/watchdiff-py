@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from watchdiff.ai_summarizer import AiError, call_provider, get_provider
 from watchdiff.db_diff import DbDiffEngine
 from watchdiff.db_fetcher import DbFetcher
 from watchdiff.db_models import (
@@ -61,33 +62,89 @@ def _deserialize(content: str, config: DbWatchConfig) -> DbSnapshot:
     return DbSnapshot.create(config.connection_string, config.table, rows, schema)
 
 
-def _dispatch(report: DbDiffReport, config: DbWatchConfig) -> None:
+def _build_db_prompt(report: DbDiffReport) -> str:
+    lines = []
+    for c in report.changes[:20]:
+        if c.kind.value == "inserted":
+            lines.append(f"Row inserted: {c.row_key or str(c.row)}")
+        elif c.kind.value == "deleted":
+            lines.append(f"Row deleted: {c.row_key or str(c.row)}")
+        elif c.kind.value == "updated":
+            mods = ", ".join(
+                f"{m.column}: {m.before} -> {m.after}"
+                for m in (c.modifications or [])
+            )
+            lines.append(f"Row {c.row_key} updated - {mods}")
+        elif c.kind.value == "schema_changed":
+            lines.append(f"Schema {c.context or 'changed'}: column \"{c.column}\"")
+        elif c.kind.value == "threshold_exceeded":
+            lines.append(f"Aggregate changed: {c.before} -> {c.after}")
+        elif c.kind.value == "value_changed":
+            lines.append(f"Value changed: {c.before} -> {c.after}")
+    return (
+        "You are monitoring a database table for changes. Summarize the following diff in 1-2 sentences "
+        "in plain language, focusing on what is important to a human reader.\n\n"
+        f"Table: {report.label} (mode: {report.diff_mode.value})\nChanges:\n"
+        + "\n".join(lines)
+        + "\n\nSummary:"
+    )
+
+
+def _dispatch(report: DbDiffReport, config: DbWatchConfig, ai_disabled: set[str], key: str) -> None:
+    # AI summary
+    if getattr(config, "ai_summary", False) and key not in ai_disabled:
+        provider = get_provider(config)
+        if provider:
+            try:
+                report.ai_summary = call_provider(_build_db_prompt(report), provider)
+                if report.ai_summary:
+                    logger.debug("[%s] AI summary: %s", config.label, report.ai_summary)
+            except AiError as exc:
+                if exc.is_permanent:
+                    ai_disabled.add(key)
+                    logger.warning("[%s] AI summaries disabled - %s: %s", config.label, exc.kind, exc)
+                elif exc.kind.value == "quota_exceeded":
+                    logger.warning("[%s] AI quota exceeded - skipping this check.", config.label)
+                else:
+                    logger.warning("[%s] AI summary skipped (%s): %s", config.label, exc.kind, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] AI summary error: %s", config.label, exc)
+
     schema_changes = [c for c in report.changes if c.kind.value == "schema_changed"]
     if schema_changes and config.on_schema_change:
-        config.on_schema_change(SchemaChangeInfo(
-            connection_string=config.connection_string,
-            table=config.table,
-            label=config.label,
-            changes=schema_changes,
-        ))
+        try:
+            config.on_schema_change(SchemaChangeInfo(
+                connection_string=config.connection_string,
+                table=config.table,
+                label=config.label,
+                changes=schema_changes,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[watchdiff:db] on_schema_change callback error: %s", exc)
 
     for tc in [c for c in report.changes if c.kind.value == "threshold_exceeded"]:
         if config.on_threshold:
             prev = float(tc.before or 0)
             curr = float(tc.after or 0)
             pct  = abs((curr - prev) / prev) * 100 if prev != 0 else 100.0
-            config.on_threshold(ThresholdInfo(
-                connection_string=config.connection_string,
-                table=config.table,
-                label=config.label,
-                previous_value=prev,
-                current_value=curr,
-                change_percent=pct,
-                threshold=config.threshold or 0.0,
-            ))
+            try:
+                config.on_threshold(ThresholdInfo(
+                    connection_string=config.connection_string,
+                    table=config.table,
+                    label=config.label,
+                    previous_value=prev,
+                    current_value=curr,
+                    change_percent=pct,
+                    threshold=config.threshold or 0.0,
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[watchdiff:db] on_threshold callback error: %s", exc)
 
     if config.on_change:
-        config.on_change(report)
+        try:
+            config.on_change(report)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[watchdiff:db] on_change callback error: %s", exc)
 
     if config.webhooks:
         _fire_webhooks(report, config)
@@ -137,6 +194,7 @@ class DbSyncScheduler:
         self._errors_count:     dict[str, int]                  = {}
         self._last_cooldown:    dict[str, float]                = {}
         self._configs:          list[DbWatchConfig]             = []
+        self._ai_disabled:      set[str]                        = set()
 
     def start(self, configs: list[DbWatchConfig], block: bool = True) -> None:
         self._configs = list(configs)
@@ -217,12 +275,15 @@ class DbSyncScheduler:
             self._changes_count[key] = self._changes_count.get(key, 0) + 1
             self._last_change_at[key] = datetime.now(timezone.utc)
 
-            _dispatch(report, config)
+            _dispatch(report, config, self._ai_disabled, key)
 
         except Exception as exc:
             self._errors_count[key] = self._errors_count.get(key, 0) + 1
             if config.on_error:
-                config.on_error(exc, config)
+                try:
+                    config.on_error(exc, config)
+                except Exception as cb_exc:  # noqa: BLE001
+                    logger.warning("[watchdiff:db] on_error callback error: %s", cb_exc)
             else:
                 logger.error("[watchdiff:db] %s: %s", config.label, exc)
         finally:
@@ -280,6 +341,7 @@ class DbAsyncScheduler:
         self._last_cooldown:  dict[str, float]                = {}
         self._configs:        list[DbWatchConfig]             = []
         self._stop:           bool                            = False
+        self._ai_disabled:    set[str]                        = set()
 
     async def start(self, configs: list[DbWatchConfig]) -> None:
         self._configs = list(configs)
@@ -347,12 +409,15 @@ class DbAsyncScheduler:
             self._changes_count[key] = self._changes_count.get(key, 0) + 1
             self._last_change_at[key] = datetime.now(timezone.utc)
 
-            _dispatch(report, config)
+            _dispatch(report, config, self._ai_disabled, key)
 
         except Exception as exc:
             self._errors_count[key] = self._errors_count.get(key, 0) + 1
             if config.on_error:
-                config.on_error(exc, config)
+                try:
+                    config.on_error(exc, config)
+                except Exception as cb_exc:  # noqa: BLE001
+                    logger.warning("[watchdiff:db] on_error callback error: %s", cb_exc)
             else:
                 logger.error("[watchdiff:db] %s: %s", config.label, exc)
         finally:

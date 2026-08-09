@@ -1001,6 +1001,125 @@ watchdiff status
 watchdiff status --config watchdiff.config.json
 ```
 
+## AI summaries
+
+Add a natural-language summary to every change alert. WatchDiff sends the diff to your AI provider of choice and attaches the result to `DiffReport.ai_summary`.
+
+### Auto-discovery (recommended)
+
+Set one of the following environment variables - WatchDiff picks it up automatically:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENAI_API_KEY="sk-..."
+export GEMINI_API_KEY="AIza..."
+```
+
+```python
+wd.watch("https://example.com/prices", target=".price",
+         ai_summary=True,  # provider auto-detected from env
+         on_change=lambda r: print(r.ai_summary))
+```
+
+Priority order when multiple keys are set: `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY` / `GOOGLE_AI_API_KEY`.
+
+### Explicit provider
+
+```python
+from watchdiff import AiProvider
+
+wd.watch("https://example.com", ai_summary=True,
+         ai_provider=AiProvider(type="gemini",    api_key="...", model="gemini-3.1-flash-lite"))
+wd.watch("https://example.com", ai_summary=True,
+         ai_provider=AiProvider(type="anthropic", api_key="...", model="claude-haiku-4-5-20251001"))
+wd.watch("https://example.com", ai_summary=True,
+         ai_provider=AiProvider(type="openai",    api_key="...", model="gpt-4o-mini"))
+```
+
+### OpenAI-compatible providers (Ollama, Mistral, Groq, ...)
+
+```python
+# Local Ollama
+AiProvider(type="openai", base_url="http://localhost:11434/v1", model="llama3")
+
+# Mistral
+AiProvider(type="openai", api_key="...", base_url="https://api.mistral.ai/v1", model="mistral-small")
+
+# Groq
+AiProvider(type="openai", api_key="...", base_url="https://api.groq.com/openai/v1", model="llama3-8b-8192")
+```
+
+### Custom function (any provider, any library)
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+wd.watch("https://example.com", ai_summary=True,
+         ai_provider=AiProvider(
+             type="custom",
+             call_ai=lambda prompt: client.messages.create(
+                 model="claude-opus-4-7",
+                 max_tokens=200,
+                 messages=[{"role": "user", "content": prompt}],
+             ).content[0].text,
+         ))
+```
+
+### Custom prompt
+
+Override the default summary template with `ai_prompt` - pass a static string or a callable that receives the `DiffReport` and returns a prompt string.
+
+```python
+# Static prompt - replaces the full instruction sent to the AI
+wd.watch_file("/tmp/prices.txt", ai_summary=True,
+              ai_prompt="Summarize this change in French in one sentence.")
+
+# Dynamic prompt - build the prompt from the diff report
+wd.watch("https://example.com/stock", ai_summary=True,
+         ai_prompt=lambda r: (
+             f"You are monitoring {r.url}. "
+             f"Explain in plain English what changed: "
+             + ", ".join(c.after or c.before or "" for c in r.changes)
+         ))
+```
+
+The prompt is sent as-is to the provider - no variable substitution happens automatically. Use the callable form to interpolate any data from the `DiffReport`.
+
+### Built-in providers
+
+| Provider | `type` | Default model |
+|---|---|---|
+| Google Gemini | `"gemini"` | `gemini-3.1-flash-lite` |
+| Anthropic Claude | `"anthropic"` | `claude-haiku-4-5-20251001` |
+| OpenAI / compatible | `"openai"` | `gpt-4o-mini` |
+| Any custom function | `"custom"` | - |
+
+### Error handling
+
+AI failures are non-fatal - the watcher keeps running and fires its normal alerts.
+
+| Error kind | What triggers it | Behaviour |
+|---|---|---|
+| `invalid_key` | 401 / 403 | AI disabled for this watcher for the rest of the session |
+| `quota_exceeded` | 429 rate limit | Skips AI this check, retries next interval |
+| `model_error` | 400 / unknown model | AI disabled - check your `model` value |
+| `network_error` | DNS / timeout | Skips this check, retries next interval |
+
+```python
+from watchdiff import AiError
+
+try:
+    from watchdiff.ai_summarizer import generate_ai_summary
+    summary = generate_ai_summary(report, provider)
+except AiError as e:
+    print(e.kind)          # AiErrorKind.QUOTA_EXCEEDED
+    print(e.is_retryable)  # True  - retry next check
+    print(e.is_permanent)  # False - don't disable
+    print(e.status_code)   # 429
+```
+
 ## API reference
 
 ### `WatchDiff`
@@ -1055,6 +1174,12 @@ Register a URL to monitor. All keyword arguments are optional. Returns `self` (c
 | `on_spike` | `Callable \| None` | `None` | Called with `SpikeInfo` when spike is detected |
 | `alert_on_status_change` | `bool` | `False` | Alert when HTTP status code changes (200→503, etc.) |
 | `on_status_change` | `Callable \| None` | `None` | Called with `StatusChangeInfo` on status code change |
+| `alert_if` | `Callable[[DiffReport], bool] \| None` | `None` | Custom gate - only alert when this function returns `True` |
+| `expected_status` | `int \| None` | `None` | Fire `on_error` when actual HTTP status differs from this value |
+| `track_response_time` | `bool` | `False` | Record response time in milliseconds in `DiffReport.response_time_ms` |
+| `ai_summary` | `bool` | `False` | Generate an AI natural-language summary of detected changes |
+| `ai_provider` | `AiProvider \| None` | `None` | AI provider to use. Auto-detected from env vars when `None` |
+| `ai_prompt` | `str \| Callable[[DiffReport], str] \| None` | `None` | Custom prompt sent to the AI instead of the default template |
 
 ```python
 # Chainable
@@ -1101,6 +1226,64 @@ wd.watch_db("sqlite:///app.db", "orders",
             ignore_columns=["updated_at"],
             on_change=lambda r: print(r.summary()))
 wd.start()
+```
+
+#### `.watch_file(path, *, ...)`
+
+Watch a local file for changes. Accepts all the same options as `.watch()` (except browser-related ones). The path is converted to a `file://` URL internally. Content is compared as raw text, bypassing the HTML cleaner.
+
+```python
+wd.watch_file("/etc/nginx/nginx.conf", interval=30, diff_mode="line",
+              on_change=lambda r: print("Config changed:", r.changes))
+
+wd.watch_file("/var/log/app.log", interval=5,
+              alert_if=lambda r: any("ERROR" in (c.after or "") for c in r.changes))
+
+wd.watch_file("/tmp/prices.txt", interval=2, ai_summary=True,
+              on_change=lambda r: print(r.ai_summary))
+```
+
+#### `.watch_api(url, *, ...)`
+
+Convenience wrapper over `.watch()` pre-configured for JSON API monitoring: sets `diff_mode="json"`, `track_response_time=True`, and `expected_status=200` by default.
+
+```python
+wd.watch_api("https://api.example.com/prices",
+             interval=60,
+             on_change=lambda r: print(f"API changed, responded in {r.response_time_ms:.0f}ms"))
+
+# Alert when response time exceeds 500ms
+wd.watch_api("https://api.example.com/health",
+             interval=30,
+             alert_if=lambda r: (r.response_time_ms or 0) > 500)
+```
+
+#### `.watch_cert(host, *, port=443, warning_days=30, ...)`
+
+Monitor an SSL/TLS certificate for expiry and fingerprint changes.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `hostname` | `str` | — | Hostname to connect to |
+| `port` | `int` | `443` | TLS port |
+| `interval` | `int` | `86400` | Seconds between checks |
+| `label` | `str \| None` | `hostname:port` | Human-readable name |
+| `warn_days_before_expiry` | `int` | `30` | Days before expiry to start firing `on_expiry` |
+| `alert_on_change` | `bool` | `True` | Fire `on_change` when cert fingerprint changes |
+| `alert_on_expiry` | `bool` | `True` | Fire `on_expiry` when cert is nearing expiry |
+| `on_expiry` | `Callable \| None` | `None` | Called with `CertExpiryInfo` when expiry is approaching |
+| `on_change` | `Callable \| None` | `None` | Called with `CertChangeInfo` when fingerprint changes |
+| `on_error` | `Callable \| None` | `None` | Called with `(exc, config)` on fetch error |
+
+```python
+wd.watch_cert("api.example.com",
+              warn_days_before_expiry=14,
+              on_expiry=lambda i: print(f"Cert expires in {i.days_until_expiry} days"),
+              on_change=lambda i: print("Cert fingerprint changed!", i.current_fingerprint))
+
+statuses = wd.get_cert_statuses()  # list[CertWatcherStatus]
+for s in statuses:
+    print(s.hostname, s.last_check_at, s.days_until_expiry, s.is_expiring_soon)
 ```
 
 #### `.on_change(callback)`

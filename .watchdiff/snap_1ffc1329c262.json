@@ -1,0 +1,34 @@
+[
+  {
+    "url": "file:///tmp/wd_py_ai.txt",
+    "target": null,
+    "content": "initial content for AI test",
+    "raw_html": "initial content for AI test",
+    "captured_at": "2026-08-08T19:50:26.727466+00:00",
+    "checksum": "31e4c36c2bcf89c417feb822785f60e2af2b9c3db7ff74b0f4cb1db11f9f8eec"
+  },
+  {
+    "url": "file:///tmp/wd_py_ai.txt",
+    "target": null,
+    "content": "initial content for AI test",
+    "raw_html": "initial content for AI test",
+    "captured_at": "2026-08-08T19:50:28.728702+00:00",
+    "checksum": "31e4c36c2bcf89c417feb822785f60e2af2b9c3db7ff74b0f4cb1db11f9f8eec"
+  },
+  {
+    "url": "file:///tmp/wd_py_ai.txt",
+    "target": null,
+    "content": "The price dropped from 100 euros to 75 euros on the main page.",
+    "raw_html": "The price dropped from 100 euros to 75 euros on the main page.",
+    "captured_at": "2026-08-08T19:50:30.730081+00:00",
+    "checksum": "6199cf960858ad9beb627385b711b029d9d51dce2256dbb64517e609796650da"
+  },
+  {
+    "url": "file:///tmp/wd_py_ai.txt",
+    "target": null,
+    "content": "The price dropped from 100 euros to 75 euros on the main page.",
+    "raw_html": "The price dropped from 100 euros to 75 euros on the main page.",
+    "captured_at": "2026-08-08T19:50:35.532737+00:00",
+    "checksum": "6199cf960858ad9beb627385b711b029d9d51dce2256dbb64517e609796650da"
+  }
+]

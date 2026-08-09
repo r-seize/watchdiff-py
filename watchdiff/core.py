@@ -75,11 +75,13 @@ class WatchDiff:
         self._store: Any                                           = store if store is not None else Store(storage_dir)
         self._configs: list[WatchConfig]                           = []
         self._db_configs: list[Any]                                = []
+        self._cert_configs: list[Any]                              = []
         self._global_callbacks: list[Callable[[DiffReport], None]] = []
         self._scheduler: SyncScheduler | None                      = None
         self._async_scheduler: AsyncScheduler | None               = None
         self._db_scheduler: Any | None                             = None
         self._async_db_scheduler: Any | None                       = None
+        self._cert_scheduler: Any | None                           = None
         self._status_server: Any | None                            = None
 
     # ------------------------------------------------------------------
@@ -124,6 +126,12 @@ class WatchDiff:
         on_spike: Callable[[SpikeInfo], None] | None                                          = None,
         alert_on_status_change: bool                                                           = False,
         on_status_change: Callable[[StatusChangeInfo], None] | None                           = None,
+        alert_if: Callable[[DiffReport], bool] | None                                         = None,
+        ai_summary: bool                                                                       = False,
+        ai_provider: Any | None                                                                = None,
+        is_file: bool                                                                          = False,
+        expected_status: int | None                                                            = None,
+        track_response_time: bool                                                              = False,
     ) -> WatchDiff:
         """
         Register a URL to monitor.
@@ -208,6 +216,12 @@ class WatchDiff:
             on_spike                 = on_spike,
             alert_on_status_change   = alert_on_status_change,
             on_status_change         = on_status_change,
+            alert_if                 = alert_if,
+            ai_summary               = ai_summary,
+            ai_provider              = ai_provider,
+            is_file                  = is_file,
+            expected_status          = expected_status,
+            track_response_time      = track_response_time,
         )
         self._configs.append(config)
         return self
@@ -249,6 +263,8 @@ class WatchDiff:
         on_schema_change: Callable[[Any], None] | None    = None,
         on_threshold: Callable[[Any], None] | None        = None,
         on_error: Callable[[Exception, Any], None] | None = None,
+        ai_summary: bool                                  = False,
+        ai_provider: Any | None                           = None,
     ) -> WatchDiff:
         """
         Register a database table to monitor.
@@ -299,13 +315,167 @@ class WatchDiff:
             max_snapshots   = max_snapshots,
             webhooks        = webhooks or [],
             webhook_retries = webhook_retries,
-            on_change       = on_change,
+            on_change        = on_change,
             on_schema_change = on_schema_change,
-            on_threshold    = on_threshold,
-            on_error        = on_error,
+            on_threshold     = on_threshold,
+            on_error         = on_error,
+            ai_summary       = ai_summary,
+            ai_provider      = ai_provider,
         )
         self._db_configs.append(config)
         return self
+
+    def watch_file(
+        self,
+        path: str,
+        *,
+        interval: int                                                                          = 60,
+        label: str | None                                                                      = None,
+        diff_mode: str                                                                         = "line",
+        ignore_patterns: list[str] | None                                                      = None,
+        cooldown: int                                                                          = 0,
+        dry_run: bool                                                                          = False,
+        max_snapshots: int | None                                                              = None,
+        change_threshold: float | None                                                         = None,
+        ignore_numbers: bool                                                                   = False,
+        on_change: Callable[[DiffReport], None] | list[Callable[[DiffReport], None]] | None   = None,
+        webhooks: list[str] | None                                                             = None,
+        webhook_retries: int                                                                   = 3,
+        alert_if: Callable[[DiffReport], bool] | None                                         = None,
+        ai_summary: bool                                                                       = False,
+        ai_provider: Any | None                                                                = None,
+        on_error: Callable[[Exception, WatchConfig], None] | None                             = None,
+    ) -> WatchDiff:
+        """
+        Register a local file to monitor for changes.
+
+        Args:
+            path: Absolute or relative path to the file.
+        """
+        url = f"file://{path}"
+        return self.watch(
+            url,
+            interval         = interval,
+            label            = label or path,
+            diff_mode        = diff_mode,
+            ignore_patterns  = ignore_patterns or [],
+            cooldown         = cooldown,
+            dry_run          = dry_run,
+            max_snapshots    = max_snapshots,
+            change_threshold = change_threshold,
+            ignore_numbers   = ignore_numbers,
+            on_change        = on_change,
+            webhooks         = webhooks,
+            webhook_retries  = webhook_retries,
+            alert_if         = alert_if,
+            ai_summary       = ai_summary,
+            ai_provider      = ai_provider,
+            on_error         = on_error,
+            is_file          = True,
+        )
+
+    def watch_api(
+        self,
+        url: str,
+        *,
+        interval: int                                                                          = 300,
+        label: str | None                                                                      = None,
+        headers: dict[str, str] | None                                                        = None,
+        timeout: int                                                                           = 15,
+        diff_mode: str                                                                         = "json",
+        expected_status: int | None                                                            = None,
+        track_response_time: bool                                                              = True,
+        cooldown: int                                                                          = 0,
+        dry_run: bool                                                                          = False,
+        max_snapshots: int | None                                                              = None,
+        on_change: Callable[[DiffReport], None] | list[Callable[[DiffReport], None]] | None   = None,
+        webhooks: list[str] | None                                                             = None,
+        webhook_retries: int                                                                   = 3,
+        alert_if: Callable[[DiffReport], bool] | None                                         = None,
+        ai_summary: bool                                                                       = False,
+        ai_provider: Any | None                                                                = None,
+        on_error: Callable[[Exception, WatchConfig], None] | None                             = None,
+    ) -> WatchDiff:
+        """
+        Register a REST API endpoint to monitor.
+
+        Args:
+            url:                 API URL to watch.
+            expected_status:     Alert when HTTP status differs from this value.
+            track_response_time: Record response_time_ms on every DiffReport.
+        """
+        return self.watch(
+            url,
+            interval             = interval,
+            label                = label,
+            headers              = headers,
+            timeout              = timeout,
+            diff_mode            = diff_mode,
+            expected_status      = expected_status,
+            track_response_time  = track_response_time,
+            cooldown             = cooldown,
+            dry_run              = dry_run,
+            max_snapshots        = max_snapshots,
+            on_change            = on_change,
+            webhooks             = webhooks,
+            webhook_retries      = webhook_retries,
+            alert_if             = alert_if,
+            ai_summary           = ai_summary,
+            ai_provider          = ai_provider,
+            on_error             = on_error,
+        )
+
+    def watch_cert(
+        self,
+        hostname: str,
+        *,
+        port: int                                                                         = 443,
+        interval: int                                                                     = 86400,
+        label: str | None                                                                 = None,
+        warn_days_before_expiry: int                                                      = 30,
+        alert_on_change: bool                                                             = True,
+        alert_on_expiry: bool                                                             = True,
+        cooldown: int                                                                     = 0,
+        dry_run: bool                                                                     = False,
+        webhooks: list[str] | None                                                        = None,
+        webhook_retries: int                                                              = 3,
+        on_change: Callable[[Any], None] | None                                           = None,
+        on_expiry: Callable[[Any], None] | None                                           = None,
+        on_error: Callable[[Exception, Any], None] | None                                 = None,
+    ) -> WatchDiff:
+        """
+        Register an SSL certificate to monitor.
+
+        Args:
+            hostname:               Domain to check (e.g. "example.com").
+            port:                   TCP port (default 443).
+            warn_days_before_expiry: Alert when cert expires within this many days.
+        """
+        from watchdiff.cert_models import make_cert_watch_config  # noqa: PLC0415
+        config = make_cert_watch_config(
+            hostname,
+            port                    = port,
+            interval                = interval,
+            label                   = label or f"{hostname}:{port}",
+            warn_days_before_expiry = warn_days_before_expiry,
+            alert_on_change         = alert_on_change,
+            alert_on_expiry         = alert_on_expiry,
+            cooldown                = cooldown,
+            dry_run                 = dry_run,
+            webhooks                = webhooks or [],
+            webhook_retries         = webhook_retries,
+            on_change               = on_change,
+            on_expiry               = on_expiry,
+            on_error                = on_error,
+        )
+        self._cert_configs.append(config)
+        return self
+
+    def get_cert_statuses(self) -> list[Any]:
+        """Return live status for all registered SSL certificate watchers."""
+        if self._cert_scheduler is None:
+            return []
+        return self._cert_scheduler.get_statuses()
 
     # ------------------------------------------------------------------
     # Run API
@@ -323,9 +493,10 @@ class WatchDiff:
 
         has_urls = bool(self._configs)
         has_db   = bool(self._db_configs)
+        has_cert = bool(self._cert_configs)
 
-        if not has_urls and not has_db:
-            logger.warning("Nothing registered. Call .watch() or .watch_db() first.")
+        if not has_urls and not has_db and not has_cert:
+            logger.warning("Nothing registered. Call .watch(), .watch_db(), or .watch_cert() first.")
             return
 
         if has_urls:
@@ -340,6 +511,12 @@ class WatchDiff:
             db_scheduler = DbSyncScheduler(self._store)
             self._db_scheduler = db_scheduler
             db_scheduler.start(self._db_configs, block=False)
+
+        if has_cert:
+            from watchdiff.cert_scheduler import CertScheduler  # noqa: PLC0415
+            cert_scheduler = CertScheduler()
+            self._cert_scheduler = cert_scheduler
+            cert_scheduler.start(self._cert_configs, block=False)
 
         if block:
             try:
@@ -390,6 +567,8 @@ class WatchDiff:
             self._db_scheduler.stop()
         if self._async_db_scheduler:
             self._async_db_scheduler.stop()
+        if self._cert_scheduler:
+            self._cert_scheduler.stop()
 
     def check_once(self, url: str) -> DiffReport | None:
         """
@@ -619,8 +798,8 @@ class WatchDiff:
             headers:          Extra HTTP headers.
             ignore_selectors: CSS selectors to strip before diffing.
             ignore_patterns:  Regex patterns to strip from text before diffing.
-            proxies:          Proxy URLs — one picked randomly per request.
-            user_agents:      User-Agent strings — one picked randomly per request.
+            proxies:          Proxy URLs - one picked randomly per request.
+            user_agents:      User-Agent strings - one picked randomly per request.
 
         Returns:
             DiffReport comparing the two pages.

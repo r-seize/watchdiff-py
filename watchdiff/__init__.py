@@ -1,3 +1,22 @@
+from watchdiff.ai_summarizer import (
+    AiError,
+    AiErrorKind,
+    AiProvider,
+    ai_summary_enabled,
+    call_provider,
+    generate_ai_summary,
+    get_provider,
+    resolve_provider,
+)
+from watchdiff.cert_models import (
+    CertChangeInfo,
+    CertExpiryInfo,
+    CertReport,
+    CertSnapshot,
+    CertWatchConfig,
+    CertWatcherStatus,
+    make_cert_watch_config,
+)
 from watchdiff.core import WatchDiff
 from watchdiff.db_models import (
     DbChange,
@@ -16,12 +35,22 @@ from watchdiff.db_models import (
     make_db_watch_config,
 )
 from watchdiff.exporter import Exporter
+from watchdiff.file_fetcher import FileFetcher, file_path_from_url
 from watchdiff.models import BrowserOptions, DiffMode, SpikeInfo, StatusChangeInfo, WatchConfig
 from watchdiff.status_server import StatusServer
 from watchdiff.store import SqliteStore, Store
 
 __all__ = [
+    "AiError",
+    "AiErrorKind",
+    "AiProvider",
     "BrowserOptions",
+    "CertChangeInfo",
+    "CertExpiryInfo",
+    "CertReport",
+    "CertSnapshot",
+    "CertWatchConfig",
+    "CertWatcherStatus",
     "DbChange",
     "DbChangeKind",
     "DbDiffMode",
@@ -32,6 +61,7 @@ __all__ = [
     "DbWatcherStatus",
     "DiffMode",
     "Exporter",
+    "FileFetcher",
     "SchemaChangeInfo",
     "SqliteStore",
     "SpikeInfo",
@@ -41,8 +71,15 @@ __all__ = [
     "ThresholdInfo",
     "WatchConfig",
     "WatchDiff",
+    "ai_summary_enabled",
+    "call_provider",
     "db_has_changes",
     "db_report_summary",
     "db_snapshot_key",
+    "file_path_from_url",
+    "generate_ai_summary",
+    "get_provider",
+    "make_cert_watch_config",
     "make_db_watch_config",
+    "resolve_provider",
 ]

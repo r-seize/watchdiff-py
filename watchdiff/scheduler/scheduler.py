@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 from pathlib import Path
 
+from watchdiff.ai_summarizer import AiError, call_provider, generate_ai_summary, get_provider
 from watchdiff.cleaner import Cleaner
 from watchdiff.diff import DiffEngine
 from watchdiff.fetcher import AsyncFetcher, Fetcher
@@ -76,6 +77,7 @@ class SyncScheduler:
         self._recent_change_times: dict[str, list[float]]            = {}
         self._last_spike_at: dict[str, float]                        = {}
         self._last_status_code: dict[str, int]                       = {}
+        self._ai_disabled: set[str]                                  = set()
 
     def add_global_callback(self, callback: Callable[[DiffReport], None]) -> None:
         """Register a callback called for every DiffReport (regardless of config)."""
@@ -184,7 +186,10 @@ class SyncScheduler:
             stop_event.wait(timeout=effective)
 
     def _fetch(self, config: WatchConfig) -> str:
-        """Dispatch to BrowserFetcher or Fetcher based on config.browser."""
+        """Dispatch to FileFetcher, BrowserFetcher, or Fetcher."""
+        if getattr(config, "is_file", False):
+            from watchdiff.file_fetcher import FileFetcher  # noqa: PLC0415
+            return FileFetcher().fetch(config)
         if config.browser:
             if self._browser_fetcher is None:
                 from watchdiff.fetcher.browser import BrowserFetcher  # noqa: PLC0415
@@ -201,6 +206,7 @@ class SyncScheduler:
         if config.ignore_numbers:
             extra_patterns.append(r"\b\d+(\.\d+)?\b")
 
+        t0 = time.monotonic() if getattr(config, "track_response_time", False) else None
         try:
             html = self._fetch(config)
         except Exception as exc:  # noqa: BLE001
@@ -215,20 +221,35 @@ class SyncScheduler:
                     logger.warning("[%s] on_error callback error: %s", config.label, cb_exc)
             return None
 
+        response_time_ms = (time.monotonic() - t0) * 1000 if t0 is not None else None
+
+        expected_status = getattr(config, "expected_status", None)
+        if expected_status is not None and expected_status != 200:
+            err = Exception(f"Expected HTTP {expected_status}, got 200")
+            self._errors_count[key] = self._errors_count.get(key, 0) + 1
+            if config.on_error:
+                try:
+                    config.on_error(err, config)
+                except Exception as cb_exc:  # noqa: BLE001
+                    logger.warning("[%s] on_error callback error: %s", config.label, cb_exc)
+
         self._handle_status_change(key, 200, config)
 
-        cleaner = Cleaner(
-            extra_selectors = config.ignore_selectors,
-            extra_patterns  = extra_patterns,
-        )
-        soup = cleaner.clean(html)
-
-        try:
-            snapshot = self._parser.extract(soup, config)
-        except ParserError as exc:
-            self._errors_count[key] = self._errors_count.get(key, 0) + 1
-            logger.error("[%s] Parse failed: %s", config.label, exc)
-            return None
+        if getattr(config, "is_file", False):
+            from watchdiff.models import Snapshot  # noqa: PLC0415
+            snapshot = Snapshot(url=config.url, target=config.target, content=html, raw_html=html)
+        else:
+            cleaner = Cleaner(
+                extra_selectors = config.ignore_selectors,
+                extra_patterns  = extra_patterns,
+            )
+            soup = cleaner.clean(html)
+            try:
+                snapshot = self._parser.extract(soup, config)
+            except ParserError as exc:
+                self._errors_count[key] = self._errors_count.get(key, 0) + 1
+                logger.error("[%s] Parse failed: %s", config.label, exc)
+                return None
 
         previous = self._store.load_latest(config.url, config.target)
 
@@ -239,6 +260,8 @@ class SyncScheduler:
             return None
 
         report = self._engine.compare(previous, snapshot, config)
+        if response_time_ms is not None:
+            report.response_time_ms = response_time_ms
 
         if not config.dry_run:
             self._store.save_snapshot(snapshot)
@@ -259,6 +282,16 @@ class SyncScheduler:
                     )
                     return report
 
+            # alert_if - custom condition gate
+            alert_if = getattr(config, "alert_if", None)
+            if alert_if is not None:
+                try:
+                    if not alert_if(report):
+                        logger.debug("[%s] alert_if returned False - alert suppressed.", config.label)
+                        return report
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] alert_if callback error: %s", config.label, exc)
+
             if not config.dry_run:
                 self._store.save_report(report)
 
@@ -266,6 +299,25 @@ class SyncScheduler:
             self._last_change_at[key] = time.time()
             self._silence_fired[key]  = False
             logger.info("[%s] %s", config.label, report.summary())
+
+            # AI summary
+            if getattr(config, "ai_summary", False) and key not in self._ai_disabled:
+                provider = get_provider(config)
+                if provider:
+                    try:
+                        report.ai_summary = generate_ai_summary(report, provider, getattr(config, "ai_prompt", None))
+                        if report.ai_summary:
+                            logger.debug("[%s] AI summary: %s", config.label, report.ai_summary)
+                    except AiError as exc:
+                        if exc.is_permanent:
+                            self._ai_disabled.add(key)
+                            logger.warning("[%s] AI summaries disabled - %s: %s", config.label, exc.kind, exc)
+                        elif exc.kind.value == "quota_exceeded":
+                            logger.warning("[%s] AI quota exceeded - skipping this check.", config.label)
+                        else:
+                            logger.warning("[%s] AI summary skipped (%s): %s", config.label, exc.kind, exc)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("[%s] AI summary error: %s", config.label, exc)
 
             # Spike detection
             if config.change_spike_window and config.change_spike_threshold:
@@ -461,6 +513,7 @@ class AsyncScheduler:
         self._recent_change_times: dict[str, list[float]]            = {}
         self._last_spike_at: dict[str, float]                        = {}
         self._last_status_code: dict[str, int]                       = {}
+        self._ai_disabled: set[str]                                  = set()
 
     def add_global_callback(self, callback: Callable[[DiffReport], None]) -> None:
         self._on_diff_callbacks.append(callback)
@@ -533,7 +586,10 @@ class AsyncScheduler:
             await asyncio.sleep(effective)
 
     async def _fetch(self, config: WatchConfig) -> str:
-        """Dispatch to AsyncBrowserFetcher or AsyncFetcher based on config.browser."""
+        """Dispatch to FileFetcher, AsyncBrowserFetcher, or AsyncFetcher."""
+        if getattr(config, "is_file", False):
+            from watchdiff.file_fetcher import FileFetcher  # noqa: PLC0415
+            return FileFetcher().fetch(config)
         if config.browser:
             if self._browser_fetcher is None:
                 from watchdiff.fetcher.browser import AsyncBrowserFetcher  # noqa: PLC0415
@@ -550,6 +606,7 @@ class AsyncScheduler:
         if config.ignore_numbers:
             extra_patterns.append(r"\b\d+(\.\d+)?\b")
 
+        t0 = time.monotonic() if getattr(config, "track_response_time", False) else None
         try:
             html = await self._fetch(config)
         except Exception as exc:  # noqa: BLE001
@@ -564,20 +621,35 @@ class AsyncScheduler:
                     logger.warning("[%s] on_error callback error: %s", config.label, cb_exc)
             return None
 
+        response_time_ms = (time.monotonic() - t0) * 1000 if t0 is not None else None
+
+        expected_status = getattr(config, "expected_status", None)
+        if expected_status is not None and expected_status != 200:
+            err = Exception(f"Expected HTTP {expected_status}, got 200")
+            self._errors_count[key] = self._errors_count.get(key, 0) + 1
+            if config.on_error:
+                try:
+                    config.on_error(err, config)
+                except Exception as cb_exc:  # noqa: BLE001
+                    logger.warning("[%s] on_error callback error: %s", config.label, cb_exc)
+
         await self._handle_status_change(key, 200, config)
 
-        cleaner = Cleaner(
-            extra_selectors = config.ignore_selectors,
-            extra_patterns  = extra_patterns,
-        )
-        soup = cleaner.clean(html)
-
-        try:
-            snapshot = self._parser.extract(soup, config)
-        except ParserError as exc:
-            self._errors_count[key] = self._errors_count.get(key, 0) + 1
-            logger.error("[%s] Parse failed: %s", config.label, exc)
-            return None
+        if getattr(config, "is_file", False):
+            from watchdiff.models import Snapshot  # noqa: PLC0415
+            snapshot = Snapshot(url=config.url, target=config.target, content=html, raw_html=html)
+        else:
+            cleaner = Cleaner(
+                extra_selectors = config.ignore_selectors,
+                extra_patterns  = extra_patterns,
+            )
+            soup = cleaner.clean(html)
+            try:
+                snapshot = self._parser.extract(soup, config)
+            except ParserError as exc:
+                self._errors_count[key] = self._errors_count.get(key, 0) + 1
+                logger.error("[%s] Parse failed: %s", config.label, exc)
+                return None
 
         previous = self._store.load_latest(config.url, config.target)
 
@@ -588,6 +660,8 @@ class AsyncScheduler:
             return None
 
         report = self._engine.compare(previous, snapshot, config)
+        if response_time_ms is not None:
+            report.response_time_ms = response_time_ms
 
         if not config.dry_run:
             self._store.save_snapshot(snapshot)
@@ -608,6 +682,16 @@ class AsyncScheduler:
                     )
                     return report
 
+            # alert_if - custom condition gate
+            alert_if = getattr(config, "alert_if", None)
+            if alert_if is not None:
+                try:
+                    if not alert_if(report):
+                        logger.debug("[%s] alert_if returned False - alert suppressed.", config.label)
+                        return report
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] alert_if callback error: %s", config.label, exc)
+
             if not config.dry_run:
                 self._store.save_report(report)
 
@@ -615,6 +699,25 @@ class AsyncScheduler:
             self._last_change_at[key] = time.time()
             self._silence_fired[key]  = False
             logger.info("[%s] %s", config.label, report.summary())
+
+            # AI summary
+            if getattr(config, "ai_summary", False) and key not in self._ai_disabled:
+                provider = get_provider(config)
+                if provider:
+                    try:
+                        report.ai_summary = generate_ai_summary(report, provider, getattr(config, "ai_prompt", None))
+                        if report.ai_summary:
+                            logger.debug("[%s] AI summary: %s", config.label, report.ai_summary)
+                    except AiError as exc:
+                        if exc.is_permanent:
+                            self._ai_disabled.add(key)
+                            logger.warning("[%s] AI summaries disabled - %s: %s", config.label, exc.kind, exc)
+                        elif exc.kind.value == "quota_exceeded":
+                            logger.warning("[%s] AI quota exceeded - skipping this check.", config.label)
+                        else:
+                            logger.warning("[%s] AI summary skipped (%s): %s", config.label, exc.kind, exc)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("[%s] AI summary error: %s", config.label, exc)
 
             # Spike detection
             if config.change_spike_window and config.change_spike_threshold:

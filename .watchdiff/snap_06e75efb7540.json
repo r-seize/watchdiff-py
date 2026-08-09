@@ -1,0 +1,50 @@
+[
+  {
+    "url": "file:///tmp/wd_py_alertif.txt",
+    "target": null,
+    "content": "hello world",
+    "raw_html": "hello world",
+    "captured_at": "2026-08-08T19:48:55.527855+00:00",
+    "checksum": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+  },
+  {
+    "url": "file:///tmp/wd_py_alertif.txt",
+    "target": null,
+    "content": "hello world",
+    "raw_html": "hello world",
+    "captured_at": "2026-08-08T19:48:57.528922+00:00",
+    "checksum": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+  },
+  {
+    "url": "file:///tmp/wd_py_alertif.txt",
+    "target": null,
+    "content": "normal update without keyword",
+    "raw_html": "normal update without keyword",
+    "captured_at": "2026-08-08T19:48:59.530128+00:00",
+    "checksum": "cfef3f90fc679472c6b47f4339cc49dccb03d562603e778290c73f7ceae49814"
+  },
+  {
+    "url": "file:///tmp/wd_py_alertif.txt",
+    "target": null,
+    "content": "normal update without keyword",
+    "raw_html": "normal update without keyword",
+    "captured_at": "2026-08-08T19:49:01.531823+00:00",
+    "checksum": "cfef3f90fc679472c6b47f4339cc49dccb03d562603e778290c73f7ceae49814"
+  },
+  {
+    "url": "file:///tmp/wd_py_alertif.txt",
+    "target": null,
+    "content": "ERROR: something broke",
+    "raw_html": "ERROR: something broke",
+    "captured_at": "2026-08-08T19:49:03.533636+00:00",
+    "checksum": "8114e24ca2dcbfa4b1ab08d177ec679e4f62e416bf63f2f7d534e843e348b587"
+  },
+  {
+    "url": "file:///tmp/wd_py_alertif.txt",
+    "target": null,
+    "content": "ERROR: something broke",
+    "raw_html": "ERROR: something broke",
+    "captured_at": "2026-08-08T19:49:05.535577+00:00",
+    "checksum": "8114e24ca2dcbfa4b1ab08d177ec679e4f62e416bf63f2f7d534e843e348b587"
+  }
+]

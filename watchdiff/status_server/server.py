@@ -1,7 +1,7 @@
 """
 StatusServer - lightweight HTTP server exposing /health, /status, /metrics.
 
-Uses only stdlib (http.server, threading, json) — zero extra dependencies.
+Uses only stdlib (http.server, threading, json) - zero extra dependencies.
 
 Endpoints:
   GET /health   → 200 {"status": "ok"}
