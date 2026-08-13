@@ -57,7 +57,6 @@ class WatchConfig:
     ignore_selectors: list[str]      = field(default_factory=list)
     ignore_patterns: list[str]       = field(default_factory=list)
     alert: AlertConfig | None        = None
-    # --- new in 0.1.4 ---
     diff_mode: str                   = "line"   # "line" | "semantic" | "word" | "json"
     browser: bool                    = False
     browser_options: BrowserOptions | None = None
@@ -74,16 +73,13 @@ class WatchConfig:
     alert_if_no_change_after: int | None = None # fire on_silence if no change for N seconds
     on_error: Callable[[Exception, WatchConfig], None] | None = None
     on_silence: Callable[[SilenceInfo], None] | None = None
-    # --- new in 0.1.5 ---
     archive_html: bool                     = False    # save full HTML to disk on every change
     screenshot_on_change: bool             = False    # save PNG screenshot on change (browser=True required)
     change_spike_window: int | None        = None     # spike detection window in seconds
     change_spike_threshold: int | None     = None     # alert when this many changes in window
     on_spike: Callable[[SpikeInfo], None] | None = None
-    # --- new in 0.1.6 ---
     alert_on_status_change: bool                         = False
     on_status_change: Callable[[StatusChangeInfo], None] | None = None
-    # --- new in 0.2.1 ---
     is_file:              bool                           = False    # set by watch_file() - use FileFetcher
     expected_status:      int | None                     = None     # alert when HTTP status != this value
     track_response_time:  bool                           = False    # record response_time_ms in DiffReport
@@ -91,10 +87,30 @@ class WatchConfig:
     ai_summary:           bool                           = False    # generate AI summary of changes
     ai_provider:          Any | None                     = None     # AiProvider instance
     ai_prompt:            str | Callable[[DiffReport], str] | None = None  # custom prompt override
+    schedule:             str | None                     = None     # cron expression (overrides interval)
+    confirm_after:        int | None                     = None     # seconds to re-fetch before confirming change
+    json_path:            str | None                     = None     # JSONPath expression to extract before diffing
 
     def __post_init__(self) -> None:
         if not self.label:
             self.label = self.url
+
+
+@dataclass
+class SmtpConfig:
+    host: str
+    port: int
+    user: str
+    password: str
+    secure: bool | None = None
+
+
+@dataclass
+class EmailConfig:
+    to: str | list[str]
+    smtp: SmtpConfig
+    from_: str | None = None
+    subject: str | None = None
 
 
 @dataclass
@@ -105,6 +121,7 @@ class AlertConfig:
     webhooks: list[str]    = field(default_factory=list)
     min_changes: int       = 1
     webhook_retries: int   = 3  # retry attempts for failed webhook deliveries (0 = no retry)
+    email: EmailConfig | None = None
 
 
 # ---------------------------------------------------------------------------

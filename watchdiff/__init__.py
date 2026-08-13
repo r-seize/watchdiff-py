@@ -17,7 +17,9 @@ from watchdiff.cert_models import (
     CertWatcherStatus,
     make_cert_watch_config,
 )
+from watchdiff.cleaner.cleaner import Cleaner
 from watchdiff.core import WatchDiff
+from watchdiff.cron_parser import next_cron_run
 from watchdiff.db_models import (
     DbChange,
     DbChangeKind,
@@ -34,9 +36,37 @@ from watchdiff.db_models import (
     db_snapshot_key,
     make_db_watch_config,
 )
+from watchdiff.diff.engine import DiffEngine
 from watchdiff.exporter import Exporter
+from watchdiff.fetcher.browser import BrowserFetcher
+from watchdiff.fetcher.fetcher import Fetcher
 from watchdiff.file_fetcher import FileFetcher, file_path_from_url
-from watchdiff.models import BrowserOptions, DiffMode, SpikeInfo, StatusChangeInfo, WatchConfig
+from watchdiff.json_path import extract_json_path
+from watchdiff.models import (
+    AlertConfig,
+    BrowserOptions,
+    ChangeType,
+    DiffMode,
+    DiffReport,
+    EmailConfig,
+    SilenceInfo,
+    SmtpConfig,
+    Snapshot,
+    SpikeInfo,
+    StatusChangeInfo,
+    WatchConfig,
+    WatcherStatus,
+)
+from watchdiff.notifier.notifier import Notifier
+from watchdiff.parser.parser import Parser
+from watchdiff.sitemap import (
+    SitemapDiffReport,
+    SitemapEntry,
+    SitemapScheduler,
+    SitemapSnapshot,
+    SitemapWatchConfig,
+    SitemapWatcherStatus,
+)
 from watchdiff.status_server import StatusServer
 from watchdiff.store import SqliteStore, Store
 
@@ -44,6 +74,8 @@ __all__ = [
     "AiError",
     "AiErrorKind",
     "AiProvider",
+    "AlertConfig",
+    "BrowserFetcher",
     "BrowserOptions",
     "CertChangeInfo",
     "CertExpiryInfo",
@@ -51,6 +83,8 @@ __all__ = [
     "CertSnapshot",
     "CertWatchConfig",
     "CertWatcherStatus",
+    "ChangeType",
+    "Cleaner",
     "DbChange",
     "DbChangeKind",
     "DbDiffMode",
@@ -59,10 +93,25 @@ __all__ = [
     "DbSnapshot",
     "DbWatchConfig",
     "DbWatcherStatus",
+    "DiffEngine",
     "DiffMode",
+    "DiffReport",
+    "EmailConfig",
     "Exporter",
+    "Fetcher",
     "FileFetcher",
+    "Notifier",
+    "Parser",
     "SchemaChangeInfo",
+    "SilenceInfo",
+    "SitemapDiffReport",
+    "SitemapEntry",
+    "SitemapScheduler",
+    "SitemapSnapshot",
+    "SitemapWatchConfig",
+    "SitemapWatcherStatus",
+    "SmtpConfig",
+    "Snapshot",
     "SqliteStore",
     "SpikeInfo",
     "StatusChangeInfo",
@@ -71,15 +120,18 @@ __all__ = [
     "ThresholdInfo",
     "WatchConfig",
     "WatchDiff",
+    "WatcherStatus",
     "ai_summary_enabled",
     "call_provider",
     "db_has_changes",
     "db_report_summary",
     "db_snapshot_key",
+    "extract_json_path",
     "file_path_from_url",
     "generate_ai_summary",
     "get_provider",
     "make_cert_watch_config",
     "make_db_watch_config",
+    "next_cron_run",
     "resolve_provider",
 ]

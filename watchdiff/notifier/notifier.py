@@ -50,6 +50,13 @@ class Notifier:
         for url in alert.webhooks:
             self._send_webhook_with_retry(url, report, alert.webhook_retries)
 
+        if alert.email is not None:
+            from watchdiff.mailer import send_email  # noqa: PLC0415
+            try:
+                send_email(alert.email, report)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Email alert failed: %s", exc)
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------

@@ -76,12 +76,14 @@ class WatchDiff:
         self._configs: list[WatchConfig]                           = []
         self._db_configs: list[Any]                                = []
         self._cert_configs: list[Any]                              = []
+        self._sitemap_configs: list[Any]                           = []
         self._global_callbacks: list[Callable[[DiffReport], None]] = []
         self._scheduler: SyncScheduler | None                      = None
         self._async_scheduler: AsyncScheduler | None               = None
         self._db_scheduler: Any | None                             = None
         self._async_db_scheduler: Any | None                       = None
         self._cert_scheduler: Any | None                           = None
+        self._sitemap_scheduler: Any | None                        = None
         self._status_server: Any | None                            = None
 
     # ------------------------------------------------------------------
@@ -129,9 +131,13 @@ class WatchDiff:
         alert_if: Callable[[DiffReport], bool] | None                                         = None,
         ai_summary: bool                                                                       = False,
         ai_provider: Any | None                                                                = None,
+        ai_prompt: Any | None                                                                  = None,
         is_file: bool                                                                          = False,
         expected_status: int | None                                                            = None,
         track_response_time: bool                                                              = False,
+        schedule: str | None                                                                   = None,
+        confirm_after: int | None                                                              = None,
+        json_path: str | None                                                                  = None,
     ) -> WatchDiff:
         """
         Register a URL to monitor.
@@ -219,9 +225,13 @@ class WatchDiff:
             alert_if                 = alert_if,
             ai_summary               = ai_summary,
             ai_provider              = ai_provider,
+            ai_prompt                = ai_prompt,
             is_file                  = is_file,
             expected_status          = expected_status,
             track_response_time      = track_response_time,
+            schedule                 = schedule,
+            confirm_after            = confirm_after,
+            json_path                = json_path,
         )
         self._configs.append(config)
         return self
@@ -344,7 +354,10 @@ class WatchDiff:
         alert_if: Callable[[DiffReport], bool] | None                                         = None,
         ai_summary: bool                                                                       = False,
         ai_provider: Any | None                                                                = None,
+        ai_prompt: Any | None                                                                  = None,
         on_error: Callable[[Exception, WatchConfig], None] | None                             = None,
+        schedule: str | None                                                                   = None,
+        confirm_after: int | None                                                              = None,
     ) -> WatchDiff:
         """
         Register a local file to monitor for changes.
@@ -370,8 +383,11 @@ class WatchDiff:
             alert_if         = alert_if,
             ai_summary       = ai_summary,
             ai_provider      = ai_provider,
+            ai_prompt        = ai_prompt,
             on_error         = on_error,
             is_file          = True,
+            schedule         = schedule,
+            confirm_after    = confirm_after,
         )
 
     def watch_api(
@@ -394,7 +410,11 @@ class WatchDiff:
         alert_if: Callable[[DiffReport], bool] | None                                         = None,
         ai_summary: bool                                                                       = False,
         ai_provider: Any | None                                                                = None,
+        ai_prompt: Any | None                                                                  = None,
         on_error: Callable[[Exception, WatchConfig], None] | None                             = None,
+        schedule: str | None                                                                   = None,
+        confirm_after: int | None                                                              = None,
+        json_path: str | None                                                                  = None,
     ) -> WatchDiff:
         """
         Register a REST API endpoint to monitor.
@@ -422,7 +442,11 @@ class WatchDiff:
             alert_if             = alert_if,
             ai_summary           = ai_summary,
             ai_provider          = ai_provider,
+            ai_prompt            = ai_prompt,
             on_error             = on_error,
+            schedule             = schedule,
+            confirm_after        = confirm_after,
+            json_path            = json_path,
         )
 
     def watch_cert(
@@ -477,6 +501,40 @@ class WatchDiff:
             return []
         return self._cert_scheduler.get_statuses()
 
+    def watch_sitemap(
+        self,
+        url: str,
+        *,
+        interval: int = 3600,
+        label: str = "",
+        on_added: Callable | None = None,
+        on_removed: Callable | None = None,
+        on_change: Callable | None = None,
+        on_error: Callable | None = None,
+        headers: dict | None = None,
+        timeout: int = 15,
+        webhooks: list[str] | None = None,
+    ) -> WatchDiff:
+        from watchdiff.sitemap import SitemapWatchConfig  # noqa: PLC0415
+        cfg = SitemapWatchConfig(
+            url        = url,
+            interval   = interval,
+            label      = label or url,
+            timeout    = timeout,
+            on_added   = on_added,
+            on_removed = on_removed,
+            on_change  = on_change,
+            webhooks   = webhooks or [],
+        )
+        self._sitemap_configs.append(cfg)
+        return self
+
+    def get_sitemap_statuses(self) -> list[Any]:
+        """Return live status for all registered sitemap watchers."""
+        if self._sitemap_scheduler is None:
+            return []
+        return self._sitemap_scheduler.get_statuses()
+
     # ------------------------------------------------------------------
     # Run API
     # ------------------------------------------------------------------
@@ -491,12 +549,13 @@ class WatchDiff:
         """
         import time  # noqa: PLC0415
 
-        has_urls = bool(self._configs)
-        has_db   = bool(self._db_configs)
-        has_cert = bool(self._cert_configs)
+        has_urls    = bool(self._configs)
+        has_db      = bool(self._db_configs)
+        has_cert    = bool(self._cert_configs)
+        has_sitemap = bool(self._sitemap_configs)
 
-        if not has_urls and not has_db and not has_cert:
-            logger.warning("Nothing registered. Call .watch(), .watch_db(), or .watch_cert() first.")
+        if not has_urls and not has_db and not has_cert and not has_sitemap:
+            logger.warning("Nothing registered. Call .watch(), .watch_db(), .watch_cert(), or .watch_sitemap() first.")
             return
 
         if has_urls:
@@ -517,6 +576,12 @@ class WatchDiff:
             cert_scheduler = CertScheduler()
             self._cert_scheduler = cert_scheduler
             cert_scheduler.start(self._cert_configs, block=False)
+
+        if has_sitemap:
+            from watchdiff.sitemap import SitemapScheduler  # noqa: PLC0415
+            sitemap_scheduler = SitemapScheduler()
+            self._sitemap_scheduler = sitemap_scheduler
+            sitemap_scheduler.start(self._sitemap_configs)
 
         if block:
             try:
@@ -569,6 +634,8 @@ class WatchDiff:
             self._async_db_scheduler.stop()
         if self._cert_scheduler:
             self._cert_scheduler.stop()
+        if self._sitemap_scheduler:
+            self._sitemap_scheduler.stop()
 
     def check_once(self, url: str) -> DiffReport | None:
         """

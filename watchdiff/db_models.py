@@ -78,7 +78,6 @@ class DbWatchConfig:
     on_error:          Callable[[Exception, DbWatchConfig], None] | None  = None
     on_schema_change:  Callable[[SchemaChangeInfo], None] | None          = None
     on_threshold:      Callable[[ThresholdInfo], None] | None             = None
-    # --- new in 0.2.1 ---
     ai_summary:        bool                                                = False
     ai_provider:       Any | None                                          = None
 

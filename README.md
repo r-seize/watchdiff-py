@@ -34,6 +34,18 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 | Screenshot on change | `screenshot_on_change=True, browser=True` |
 | Detect change spikes | `change_spike_window=60, change_spike_threshold=5` |
 | Alert on HTTP status change | `alert_on_status_change=True` (200→503, 503→200, etc.) |
+| Monitor a local file | `.watch_file("/etc/nginx/nginx.conf", interval=30)` |
+| Monitor a REST API | `.watch_api("https://api.example.com/prices", expected_status=200)` |
+| Track API response time | `track_response_time=True` → `report.response_time_ms` |
+| Monitor SSL certificate | `.watch_cert("example.com", warn_days_before_expiry=14)` |
+| Alert only on condition | `alert_if=lambda r: any("ERROR" in (c.after or "") for c in r.changes)` |
+| Fire checks on a schedule | `schedule="0 9 * * *"` (cron expression) |
+| Confirm change before alerting | `confirm_after=30` (flapping detection) |
+| Monitor a sitemap for URL changes | `.watch_sitemap("https://example.com/sitemap.xml")` |
+| Watch one JSON field only | `json_path="$.data.price"` |
+| Send email on change | `alert=AlertConfig(email=EmailConfig(to="...", smtp=SmtpConfig(...)))` |
+| AI summary of changes | `ai_summary=True, ai_provider=AiProvider(type="gemini", api_key="...")` |
+| Customize the AI prompt | `ai_prompt="Summarize in French."` or `ai_prompt=lambda r: ...` |
 | Compare two different URLs | `.compare_urls(url_a, url_b)` / `watchdiff compare <urlA> <urlB>` |
 | Monitor a database table | `.watch_db("sqlite:///app.db", "orders")` |
 | DB diff mode | `diff_mode="row"` \| `"schema"` \| `"aggregate"` \| `"value"` |
@@ -48,6 +60,7 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 
 - [Install](#install)
 - [Quick start](#quick-start)
+- [How it works](#how-it-works)
 - [Features](#features)
   - [Diff modes](#diff-modes)
   - [RSS / Atom feeds](#rss--atom-feeds)
@@ -76,18 +89,39 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [SQLite storage backend](#sqlite-storage-backend)
   - [CSV and XLSX export](#csv-and-xlsx-export)
   - [Config file](#config-file-workflow)
+  - [AI summaries](#ai-summaries)
+  - [File monitoring](#file-monitoring)
+  - [API monitoring](#api-monitoring)
+  - [SSL certificate monitoring](#ssl-certificate-monitoring)
+  - [Condition-based alerts](#condition-based-alerts---alert_if)
+  - [Cron scheduling](#cron-scheduling)
+  - [Flapping detection](#flapping-detection)
+  - [Sitemap monitoring](#sitemap-monitoring)
+  - [JSON path targeting](#json-path-targeting)
+  - [Email alerts](#email-alerts)
 - [API reference](#api-reference)
   - [`.watch()`](#watchurl--)
   - [`.watch_db()`](#watch_dbconnection_string-table--)
+  - [`.watch_file()`](#watch_filepath--)
+  - [`.watch_api()`](#watch_apiurl--)
+  - [`.watch_cert()`](#watch_certhost--port443-warning_days30-)
+  - [`.watch_sitemap()`](#watch_sitemapurl--)
   - [`.start()` / `start_async()`](#startblock--startasync)
   - [`.stop()` / pause / resume / status](#stop--pause--resume--status)
   - [`DiffReport`](#diffreport)
+  - [`Change`](#change)
+  - [`Snapshot`](#snapshot)
+  - [`WatcherStatus`](#watcherstatus)
+  - [`SilenceInfo`](#silenceinfo)
+  - [`AlertConfig`](#alertconfig)
+  - [`BrowserOptions`](#browseroptions)
   - [`DbDiffReport`](#dbdiffreport)
   - [`DbChange`](#dbchange)
   - [`DbWatcherStatus`](#dbwatcherstatus)
   - [`SchemaChangeInfo` / `ThresholdInfo`](#schemachangeinfo--thresholdinfo)
 - [CLI reference](#cli-reference)
 - [Environment variables](#environment-variables)
+- [Advanced usage](#advanced-usage)
 - [Use cases](#use-cases)
 
 ## Why WatchDiff?
@@ -248,6 +282,38 @@ watchdiff reports https://example.com
 # Clear stored data
 watchdiff clear https://example.com
 ```
+
+## How it works
+
+### Web pipeline
+
+Every web check runs through a fixed pipeline:
+
+```
+Fetcher / BrowserFetcher → Cleaner → Parser → DiffEngine → Store → Notifier
+```
+
+1. **Fetcher** — downloads the page via `httpx`, with proxy/UA rotation and optional retry
+2. **BrowserFetcher** — optional Playwright path for JS-rendered pages
+3. **Cleaner** — strips scripts, styles, ads and tracking noise (`beautifulsoup4`)
+4. **Parser** — extracts the target CSS selector or XPath expression (or full body)
+5. **DiffEngine** — compares content in line, word, semantic, JSON or RSS mode
+6. **Store** — persists snapshots and reports as JSON files or SQLite
+7. **Notifier** — fires callbacks and webhooks on detected changes
+
+### Database pipeline
+
+Every database check runs through a parallel pipeline:
+
+```
+DbFetcher (SQLite / PostgreSQL / MySQL) → DbDiffEngine → Store → callbacks / webhooks
+```
+
+1. **DbFetcher** — executes `SELECT * FROM <table>` (or a custom query) via the appropriate driver adapter
+2. **DbDiffEngine** — compares snapshots in one of four modes: `row`, `schema`, `aggregate`, or `value`
+3. **Store** — serialises the row snapshot to JSON and saves it via the existing `Store` interface
+4. **Dispatch** — fires `on_change`, `on_schema_change`, `on_threshold` callbacks and webhooks on detected changes
+
 
 ## Features
 
@@ -1195,6 +1261,123 @@ wd.watch_api("https://api.example.com/stats",
              ))
 ```
 
+## Cron scheduling
+
+Use a 5-field cron expression instead of a fixed interval. The watcher fires at each matching time instead of every N seconds.
+
+```python
+# Every day at 9am
+wd.watch("https://example.com/prices", schedule="0 9 * * *",
+         on_change=lambda r: print("Morning check:", r.changes))
+
+# Every Monday and Friday at 8:30am
+wd.watch("https://example.com/report", schedule="30 8 * * 1,5")
+
+# Every 15 minutes during business hours (Mon-Fri, 9am-6pm)
+wd.watch("https://api.example.com/stock", schedule="*/15 9-18 * * 1-5")
+```
+
+Supported syntax: `*`, specific values, lists (`1,3,5`), ranges (`1-5`), and steps (`*/5`, `1-5/2`). When `schedule` is set, `interval` is ignored.
+
+```python
+from watchdiff import next_cron_run
+from datetime import datetime
+
+next_run = next_cron_run("0 9 * * *", datetime(2026, 1, 1, 8, 0))
+# datetime(2026, 1, 1, 9, 0)
+```
+
+## Flapping detection
+
+Re-verify a change before firing alerts. If the content reverts within `confirm_after` seconds, the alert is suppressed.
+
+```python
+wd.watch("https://example.com/status",
+         confirm_after=30,  # wait 30s then re-check before alerting
+         on_change=lambda r: print("Confirmed change:", r.changes))
+```
+
+Useful for pages with transient content (A/B tests, live scores, dashboards) where a single-check spike should not trigger an alert.
+
+## Sitemap monitoring
+
+Watch a `sitemap.xml` for added or removed URLs. Handles sitemap index files automatically.
+
+```python
+from watchdiff import WatchDiff
+
+wd = WatchDiff()
+wd.watch_sitemap(
+    "https://example.com/sitemap.xml",
+    interval=3600,
+    on_added=lambda entries: print("New URLs:", [e.url for e in entries]),
+    on_removed=lambda entries: print("Removed:", [e.url for e in entries]),
+    on_change=lambda r: print(f"{len(r.added)} added, {len(r.removed)} removed"),
+)
+wd.start()
+
+# Check status
+for s in wd.get_sitemap_statuses():
+    print(s.url, s.entry_count, s.changes_count)
+```
+
+`SitemapEntry` fields: `url`, `lastmod`, `changefreq`, `priority`.
+
+## JSON path targeting
+
+Extract a specific value from a JSON response before diffing. Only the targeted field is compared.
+
+```python
+# Only watch the "price" field, ignore all other fields
+wd.watch_api("https://api.example.com/product/42",
+             json_path="$.data.price",
+             on_change=lambda r: print("Price changed:", r.changes))
+
+# Nested path with array index
+wd.watch_api("https://api.example.com/leaderboard",
+             json_path="$.entries[0].score")
+```
+
+Supports `$`, `.key`, and `[n]` notation. Use standalone:
+
+```python
+from watchdiff import extract_json_path
+
+value = extract_json_path('{"data": {"price": 42.5}}', "$.data.price")
+# "42.5"
+```
+
+## Email alerts
+
+Send email notifications via SMTP when a change is detected. Uses Python stdlib `smtplib` — no extra dependency required.
+
+```python
+from watchdiff import WatchDiff
+from watchdiff.models import AlertConfig, EmailConfig, SmtpConfig
+
+wd = WatchDiff()
+wd.watch("https://example.com/prices",
+         alert=AlertConfig(
+             on_change=[],
+             webhooks=[],
+             min_changes=1,
+             email=EmailConfig(
+                 to="alerts@example.com",
+                 smtp=SmtpConfig(
+                     host="smtp.gmail.com",
+                     port=465,
+                     user="you@gmail.com",
+                     password="app-password",
+                 ),
+             ),
+         ))
+wd.start()
+```
+
+Optional fields: `from_` (defaults to `user@host`), `subject` (defaults to `"[WatchDiff] Change detected: {label}"`). Multiple recipients: `to=["a@x.com", "b@x.com"]`.
+
+Port `465` uses SSL from the start (`SMTP_SSL`). Other ports use `STARTTLS`.
+
 ## API reference
 
 ### `WatchDiff`
@@ -1249,12 +1432,16 @@ Register a URL to monitor. All keyword arguments are optional. Returns `self` (c
 | `on_spike` | `Callable \| None` | `None` | Called with `SpikeInfo` when spike is detected |
 | `alert_on_status_change` | `bool` | `False` | Alert when HTTP status code changes (200→503, etc.) |
 | `on_status_change` | `Callable \| None` | `None` | Called with `StatusChangeInfo` on status code change |
+| `alert` | `AlertConfig \| None` | `None` | Full alert config — use instead of `on_change`/`webhooks` to include email or fine-tune retries |
 | `alert_if` | `Callable[[DiffReport], bool] \| None` | `None` | Custom gate - only alert when this function returns `True` |
 | `expected_status` | `int \| None` | `None` | Fire `on_error` when actual HTTP status differs from this value |
 | `track_response_time` | `bool` | `False` | Record response time in milliseconds in `DiffReport.response_time_ms` |
 | `ai_summary` | `bool` | `False` | Generate an AI natural-language summary of detected changes |
 | `ai_provider` | `AiProvider \| None` | `None` | AI provider to use. Auto-detected from env vars when `None` |
 | `ai_prompt` | `str \| Callable[[DiffReport], str] \| None` | `None` | Custom prompt sent to the AI instead of the default template |
+| `schedule` | `str \| None` | `None` | 5-field cron expression. Overrides `interval` when set. |
+| `confirm_after` | `int \| None` | `None` | Re-verify after N seconds before alerting (flapping detection) |
+| `json_path` | `str \| None` | `None` | JSON path expression to extract a sub-value before diffing (e.g. `"$.data.price"`) |
 
 ```python
 # Chainable
@@ -1359,6 +1546,34 @@ wd.watch_cert("api.example.com",
 statuses = wd.get_cert_statuses()  # list[CertWatcherStatus]
 for s in statuses:
     print(s.hostname, s.last_check_at, s.days_until_expiry, s.is_expiring_soon)
+```
+
+#### `.watch_sitemap(url, *, ...)`
+
+Monitor a `sitemap.xml` for added or removed URLs. Handles sitemap index files automatically.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `url` | `str` | — | URL of the sitemap.xml |
+| `interval` | `int` | `3600` | Seconds between checks |
+| `label` | `str` | URL | Human-readable name |
+| `headers` | `dict` | `{}` | Extra HTTP headers |
+| `timeout` | `int` | `15` | HTTP timeout in seconds |
+| `on_added` | `Callable \| None` | `None` | Called with `list[SitemapEntry]` when new URLs appear |
+| `on_removed` | `Callable \| None` | `None` | Called with `list[SitemapEntry]` when URLs disappear |
+| `on_change` | `Callable \| None` | `None` | Called with `SitemapDiffReport` on any change |
+| `on_error` | `Callable \| None` | `None` | Called with `Exception` on fetch error |
+
+```python
+wd.watch_sitemap(
+    "https://example.com/sitemap.xml",
+    interval=3600,
+    on_added=lambda entries: print("New URLs:", [e.url for e in entries]),
+    on_removed=lambda entries: print("Removed:", [e.url for e in entries]),
+)
+
+for s in wd.get_sitemap_statuses():
+    print(s.url, s.entry_count, s.changes_count, s.last_check_at)
 ```
 
 #### `.on_change(callback)`
@@ -1476,18 +1691,20 @@ wd.clear("https://example.com")
 ### `DiffReport`
 
 ```python
-report.url           # str
-report.target        # str | None
-report.label         # str
-report.has_changes   # bool
-report.added         # list[Change]
-report.removed       # list[Change]
-report.modified      # list[Change]
-report.changes       # list[Change] — all changes
-report.compared_at   # datetime
+report.url              # str
+report.target           # str | None
+report.label            # str
+report.has_changes      # bool
+report.added            # list[Change]
+report.removed          # list[Change]
+report.modified         # list[Change]
+report.changes          # list[Change] — all changes
+report.compared_at      # datetime
+report.ai_summary       # str | None — populated when ai_summary=True
+report.response_time_ms # float | None — populated when track_response_time=True
 
-report.summary()     # "[Book price] 1 modified - 2024-01-15 10:30:00 UTC"
-report.as_dict()     # JSON-serialisable dict
+report.summary()        # "[Book price] 1 modified - 2024-01-15 10:30:00 UTC"
+report.as_dict()        # JSON-serialisable dict
 ```
 
 ### `Change`
@@ -1500,6 +1717,76 @@ change.context  # str | None — surrounding text hint
 
 change.human()  # "[~] Changed: '$19.00' - '$24.00'"
 str(change)     # same as .human()
+```
+
+### `Snapshot`
+
+```python
+snap.url          # str
+snap.target       # str | None
+snap.content      # str — cleaned plain-text content
+snap.raw_html     # str — raw HTML of the extracted zone
+snap.captured_at  # datetime — UTC timestamp
+snap.checksum     # str — SHA-256 of content
+
+snap.is_identical_to(other)  # bool — compare by checksum
+```
+
+### `WatcherStatus`
+
+Returned by `.status()`:
+
+```python
+status.url             # str
+status.label           # str
+status.target          # str | None
+status.interval        # int — seconds between checks
+status.paused          # bool
+status.last_check_at   # datetime | None
+status.next_check_at   # datetime | None
+status.last_change_at  # datetime | None
+status.checks_count    # int
+status.changes_count   # int
+status.errors_count    # int
+status.last_status_code # int — last known HTTP status (0 = unknown)
+
+status.as_dict()       # JSON-serialisable dict
+```
+
+### `SilenceInfo`
+
+Passed to the `on_silence` callback:
+
+```python
+info.url                      # str
+info.label                    # str
+info.seconds_since_last_change # float
+```
+
+### `AlertConfig`
+
+```python
+from watchdiff import AlertConfig
+
+AlertConfig(
+    on_change=[lambda r: print(r.summary())],  # list of callbacks
+    webhooks=["https://hooks.slack.com/..."],
+    min_changes=1,
+    webhook_retries=3,
+    email=EmailConfig(...),   # optional — requires SmtpConfig
+)
+```
+
+### `BrowserOptions`
+
+```python
+from watchdiff import BrowserOptions
+
+BrowserOptions(
+    wait_for="networkidle",     # "load" | "domcontentloaded" | "networkidle"
+    wait_for_selector=".price", # wait for CSS selector before capturing
+    timeout=30000,              # ms — Playwright page.goto timeout
+)
 ```
 
 ### `SpikeInfo`
@@ -1767,6 +2054,102 @@ ENV WATCHDIFF_LOG_FORMAT=json
 ENV WATCHDIFF_STATUS_PORT=9090
 CMD ["watchdiff", "run", "--config", "/app/watchdiff.config.json"]
 ```
+
+## Advanced usage
+
+### Use individual pipeline stages
+
+All internal modules are exported and fully typed:
+
+```python
+from watchdiff import (
+    Fetcher, BrowserFetcher, Cleaner, Parser, DiffEngine,
+    Store, SqliteStore, Notifier,
+    WatchConfig, Snapshot,
+)
+
+config  = WatchConfig(url="https://example.com", target=".price", diff_mode="word")
+fetcher = BrowserFetcher() if config.browser else Fetcher()
+html    = fetcher.fetch(config)
+
+soup     = Cleaner().clean(html)
+snapshot = Parser().extract(soup, config)
+
+store    = Store(".watchdiff")
+previous = store.load_latest(config.url, config.target)
+if previous:
+    report = DiffEngine().compare(previous, snapshot, config)
+    print(report.summary())
+
+store.save_snapshot(snapshot)
+```
+
+### Custom store implementation
+
+Implement the same interface as `Store` to use your own storage backend:
+
+```python
+from watchdiff import WatchDiff, Snapshot, DiffReport
+
+class RedisStore:
+    def save_snapshot(self, snapshot: Snapshot) -> None: ...
+    def load_latest(self, url: str, target: str | None) -> Snapshot | None: ...
+    def load_history(self, url: str, target: str | None, limit: int = 50) -> list[Snapshot]: ...
+    def clear_history(self, url: str, target: str | None) -> None: ...
+    def save_report(self, report: DiffReport) -> None: ...
+    def load_reports(self, url: str, target: str | None, limit: int = 50) -> list[dict]: ...
+
+wd = WatchDiff(store=RedisStore())
+wd.watch("https://example.com")
+wd.start()
+```
+
+### Production-ready config
+
+```python
+from watchdiff import WatchDiff, SqliteStore, AlertConfig, EmailConfig, SmtpConfig
+
+wd = WatchDiff(store=SqliteStore(".watchdiff.db"))
+
+wd.watch(
+    "https://shop.example.com/product/42",
+    target=".price",
+    label="Product 42 price",
+    interval=120,
+    jitter=0.15,
+    retries=3,
+    retry_delay=2.0,
+    cooldown=1800,
+    max_snapshots=200,
+    change_threshold=0.01,
+    diff_mode="word",
+    alert_if_no_change_after=604800,   # 1 week silence = page may be broken
+    webhooks=[
+        "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
+        "https://ntfy.sh/my-price-monitor",
+    ],
+    on_error=lambda err, cfg: logger.error({"url": cfg.url, "err": str(err)}),
+    on_silence=lambda info: logger.warning(
+        f"{info.label} has not changed in {info.seconds_since_last_change / 86400:.1f} days"
+    ),
+)
+
+wd.start()
+```
+
+### Integrate with a server shutdown hook
+
+```python
+import signal
+from watchdiff import WatchDiff
+
+wd = WatchDiff()
+wd.watch("https://example.com")
+wd.start(block=False)
+
+signal.signal(signal.SIGTERM, lambda *_: wd.stop())
+```
+
 
 ## Use cases
 
