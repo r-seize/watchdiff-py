@@ -53,6 +53,7 @@ class WatchConfig:
     interval: int                    = 300       # seconds between checks
     label: str | None                = None      # human-readable name for this watch
     headers: dict[str, str]          = field(default_factory=dict)
+    cookies: dict[str, str]          = field(default_factory=dict)
     timeout: int                     = 15        # HTTP timeout in seconds
     ignore_selectors: list[str]      = field(default_factory=list)
     ignore_patterns: list[str]       = field(default_factory=list)

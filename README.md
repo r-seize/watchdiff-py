@@ -43,6 +43,7 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 | Confirm change before alerting | `confirm_after=30` (flapping detection) |
 | Monitor a sitemap for URL changes | `.watch_sitemap("https://example.com/sitemap.xml")` |
 | Watch one JSON field only | `json_path="$.data.price"` |
+| Monitor authenticated pages | `cookies={"session": "abc123", "csrftoken": "xyz"}` |
 | Send email on change | `alert=AlertConfig(email=EmailConfig(to="...", smtp=SmtpConfig(...)))` |
 | AI summary of changes | `ai_summary=True, ai_provider=AiProvider(type="gemini", api_key="...")` |
 | Customize the AI prompt | `ai_prompt="Summarize in French."` or `ai_prompt=lambda r: ...` |
@@ -98,6 +99,7 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [Flapping detection](#flapping-detection)
   - [Sitemap monitoring](#sitemap-monitoring)
   - [JSON path targeting](#json-path-targeting)
+  - [Cookie-based authentication](#cookie-based-authentication)
   - [Email alerts](#email-alerts)
 - [API reference](#api-reference)
   - [`.watch()`](#watchurl--)
@@ -1347,6 +1349,29 @@ value = extract_json_path('{"data": {"price": 42.5}}', "$.data.price")
 # "42.5"
 ```
 
+## Cookie-based authentication
+
+Pass cookies with every request to monitor pages that require a login session. Cookies are merged into the outgoing `Cookie` header on top of any `headers` you supply.
+
+```python
+wd.watch("https://app.example.com/dashboard",
+         cookies={"session": "your-session-token", "csrftoken": "your-csrf-token"},
+         interval=300,
+         on_change=lambda r: print(r.changes))
+```
+
+Combine `cookies` with `headers` — the cookie string is appended to any existing `Cookie` header:
+
+```python
+wd.watch_api("https://api.example.com/account",
+             headers={"Authorization": "Bearer token123"},
+             cookies={"_ga": "GA1.1.0000000000.0000000000"},
+             json_path="$.balance",
+             interval=60)
+```
+
+> Tip: copy cookie values from your browser's DevTools → Network tab → Request Headers.
+
 ## Email alerts
 
 Send email notifications via SMTP when a change is detected. Uses Python stdlib `smtplib` — no extra dependency required.
@@ -1432,6 +1457,7 @@ Register a URL to monitor. All keyword arguments are optional. Returns `self` (c
 | `on_spike` | `Callable \| None` | `None` | Called with `SpikeInfo` when spike is detected |
 | `alert_on_status_change` | `bool` | `False` | Alert when HTTP status code changes (200→503, etc.) |
 | `on_status_change` | `Callable \| None` | `None` | Called with `StatusChangeInfo` on status code change |
+| `cookies` | `dict[str, str]` | `{}` | Cookies sent with every request — merged into the `Cookie` header (e.g. `{"session": "abc"}`) |
 | `alert` | `AlertConfig \| None` | `None` | Full alert config — use instead of `on_change`/`webhooks` to include email or fine-tune retries |
 | `alert_if` | `Callable[[DiffReport], bool] \| None` | `None` | Custom gate - only alert when this function returns `True` |
 | `expected_status` | `int \| None` | `None` | Fire `on_error` when actual HTTP status differs from this value |

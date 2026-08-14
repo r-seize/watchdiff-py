@@ -85,6 +85,10 @@ class Fetcher:
             FetchError: after all retries are exhausted.
         """
         headers = {**_DEFAULT_ACCEPT_HEADERS, "User-Agent": _pick_ua(config), **config.headers}
+        if config.cookies:
+            existing = headers.get("Cookie", "")
+            cookie_str = "; ".join(f"{k}={v}" for k, v in config.cookies.items())
+            headers["Cookie"] = f"{existing}; {cookie_str}" if existing else cookie_str
         proxy   = _pick_proxy(config)
 
         client_kwargs: dict = {"timeout": config.timeout, "follow_redirects": True}
@@ -133,6 +137,10 @@ class AsyncFetcher:
             FetchError: after all retries are exhausted.
         """
         headers = {**_DEFAULT_ACCEPT_HEADERS, "User-Agent": _pick_ua(config), **config.headers}
+        if config.cookies:
+            existing = headers.get("Cookie", "")
+            cookie_str = "; ".join(f"{k}={v}" for k, v in config.cookies.items())
+            headers["Cookie"] = f"{existing}; {cookie_str}" if existing else cookie_str
         proxy   = _pick_proxy(config)
 
         client_kwargs: dict = {"timeout": config.timeout, "follow_redirects": True}
