@@ -40,6 +40,7 @@ from watchdiff.models import (
     AlertConfig,
     BrowserOptions,
     DiffReport,
+    EmailConfig,
     SilenceInfo,
     SpikeInfo,
     StatusChangeInfo,
@@ -138,6 +139,7 @@ class WatchDiff:
         schedule: str | None                                                                   = None,
         confirm_after: int | None                                                              = None,
         json_path: str | None                                                                  = None,
+        email: EmailConfig | None                                                              = None,
     ) -> WatchDiff:
         """
         Register a URL to monitor.
@@ -187,7 +189,8 @@ class WatchDiff:
             webhooks        = webhooks or [],
             min_changes     = min_changes,
             webhook_retries = webhook_retries,
-        ) if (callbacks or webhooks) else None
+            email           = email,
+        ) if (callbacks or webhooks or email) else None
 
         config = WatchConfig(
             url                      = url,

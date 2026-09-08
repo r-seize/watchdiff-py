@@ -629,13 +629,19 @@ class AsyncScheduler:
             if config.url not in self._paused:
                 await self._check(config)
 
-            effective = float(config.interval)
-            if config.jitter > 0:
-                delta     = config.interval * config.jitter * random.uniform(-1, 1)
-                effective = max(1.0, effective + delta)
-
-            self._next_check_at[key] = time.time() + effective
-            await asyncio.sleep(effective)
+            if getattr(config, "schedule", None):
+                from watchdiff.cron_parser import next_cron_run  # noqa: PLC0415
+                next_dt  = next_cron_run(config.schedule)
+                delay    = max(1.0, (next_dt - datetime.now(timezone.utc)).total_seconds())
+                self._next_check_at[key] = time.time() + delay
+                await asyncio.sleep(delay)
+            else:
+                effective = float(config.interval)
+                if config.jitter > 0:
+                    delta     = config.interval * config.jitter * random.uniform(-1, 1)
+                    effective = max(1.0, effective + delta)
+                self._next_check_at[key] = time.time() + effective
+                await asyncio.sleep(effective)
 
     async def _fetch(self, config: WatchConfig) -> str:
         """Dispatch to FileFetcher, AsyncBrowserFetcher, or AsyncFetcher."""
@@ -687,7 +693,17 @@ class AsyncScheduler:
 
         await self._handle_status_change(key, 200, config)
 
-        if getattr(config, "is_file", False):
+        json_path = getattr(config, "json_path", None)
+        if json_path:
+            from watchdiff.json_path import extract_json_path  # noqa: PLC0415
+            try:
+                html = extract_json_path(html, json_path)
+            except ValueError as exc:
+                self._errors_count[key] = self._errors_count.get(key, 0) + 1
+                logger.error("[%s] json_path extraction failed: %s", config.label, exc)
+                return None
+
+        if getattr(config, "is_file", False) or json_path:
             from watchdiff.models import Snapshot  # noqa: PLC0415
             snapshot = Snapshot(url=config.url, target=config.target, content=html, raw_html=html)
         else:
@@ -721,6 +737,41 @@ class AsyncScheduler:
                 self._store.prune_snapshots(config.url, config.target, config.max_snapshots)
 
         if report.has_changes:
+            confirm_after = getattr(config, "confirm_after", None)
+            if confirm_after is not None:
+                logger.debug(
+                    "[%s] Change detected, waiting %ds to confirm.", config.label, confirm_after
+                )
+                await asyncio.sleep(confirm_after)
+                try:
+                    recheck_html = await self._fetch(config)
+                    _json_path = getattr(config, "json_path", None)
+                    if _json_path:
+                        from watchdiff.json_path import extract_json_path  # noqa: PLC0415
+                        recheck_html = extract_json_path(recheck_html, _json_path)
+                    if getattr(config, "is_file", False) or _json_path:
+                        from watchdiff.models import Snapshot as _Snapshot  # noqa: PLC0415
+                        recheck_snap = _Snapshot(
+                            url=config.url, target=config.target,
+                            content=recheck_html, raw_html=recheck_html,
+                        )
+                    else:
+                        _cleaner = Cleaner(
+                            extra_selectors=config.ignore_selectors,
+                            extra_patterns=extra_patterns,
+                        )
+                        _soup = _cleaner.clean(recheck_html)
+                        recheck_snap = self._parser.extract(_soup, config)
+                    recheck_report = self._engine.compare(previous, recheck_snap, config)
+                    if not recheck_report.has_changes:
+                        logger.info(
+                            "[%s] Transient change suppressed after confirm_after.", config.label
+                        )
+                        return report
+                    report = recheck_report
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] confirm_after recheck failed: %s", config.label, exc)
+
             if config.change_threshold is not None:
                 before_len = max(len(previous.content), 1)
                 changed    = sum(

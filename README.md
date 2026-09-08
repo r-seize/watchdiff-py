@@ -108,8 +108,13 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [`.watch_api()`](#watch_apiurl--)
   - [`.watch_cert()`](#watch_certhost--port443-warning_days30-)
   - [`.watch_sitemap()`](#watch_sitemapurl--)
-  - [`.start()` / `start_async()`](#startblock--startasync)
-  - [`.stop()` / pause / resume / status](#stop--pause--resume--status)
+  - [`.on_change()`](#on_changecallback)
+  - [`.start()` / `start_async()` / `.stop()`](#startblocktrue--await-start_async--stop)
+  - [`.check_once()`](#check_onceurl)
+  - [`.compare_urls()`](#compare_urlsurl_a-url_b--)
+  - [`.start_status_server()` / `.stop_status_server()`](#start_status_serverport-host--stop_status_server)
+  - [`.pause()` / `.resume()` / `.status()` / `.db_status()`](#pauseurl--resumeurl--status--db_status)
+  - [`.history()` / `.reports()` / `.clear()`](#historyurl--reportsurl--clearurl)
   - [`DiffReport`](#diffreport)
   - [`Change`](#change)
   - [`Snapshot`](#snapshot)
@@ -117,6 +122,11 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [`SilenceInfo`](#silenceinfo)
   - [`AlertConfig`](#alertconfig)
   - [`BrowserOptions`](#browseroptions)
+  - [`SpikeInfo`](#spikeinfo)
+  - [`StatusChangeInfo`](#statuschangeinfo)
+  - [`StatusServer`](#statusserver)
+  - [`EmailConfig` / `SmtpConfig`](#emailconfig--smtpconfig)
+  - [`SitemapDiffReport` / `SitemapEntry`](#sitemapdifreport--sitemapentry)
   - [`DbDiffReport`](#dbdiffreport)
   - [`DbChange`](#dbchange)
   - [`DbWatcherStatus`](#dbwatcherstatus)
@@ -1041,7 +1051,11 @@ Edit `watchdiff.config.json`:
       "ignore_selectors": [".cookie-banner", "#ad-container"],
       "ignore_patterns": ["\\d+ views"],
       "timeout": 15,
-      "headers": {}
+      "headers": {},
+      "schedule": null,
+      "confirm_after": null,
+      "json_path": null,
+      "email": null
     },
     {
       "url": "https://hnrss.org/frontpage",
@@ -1376,32 +1390,78 @@ wd.watch_api("https://api.example.com/account",
 
 Send email notifications via SMTP when a change is detected. Uses Python stdlib `smtplib` — no extra dependency required.
 
+### Quickstart — `email=` shortcut
+
+Pass an `EmailConfig` directly to `.watch()`:
+
 ```python
 from watchdiff import WatchDiff
-from watchdiff.models import AlertConfig, EmailConfig, SmtpConfig
+from watchdiff.models import EmailConfig, SmtpConfig
 
 wd = WatchDiff()
+wd.watch(
+    "https://example.com/prices",
+    email=EmailConfig(
+        to="alerts@example.com",
+        smtp=SmtpConfig(
+            host="smtp.gmail.com",
+            port=465,
+            user="you@gmail.com",
+            password="app-password",
+        ),
+    ),
+)
+wd.start()
+```
+
+### Via `AlertConfig` — combine with webhooks and callbacks
+
+```python
+from watchdiff.models import AlertConfig, EmailConfig, SmtpConfig
+
 wd.watch("https://example.com/prices",
          alert=AlertConfig(
-             on_change=[],
-             webhooks=[],
+             on_change=[lambda r: print(r.summary())],
+             webhooks=["https://ntfy.sh/my-topic"],
              min_changes=1,
              email=EmailConfig(
-                 to="alerts@example.com",
+                 to=["alerts@example.com", "team@example.com"],
+                 from_="watchdiff@example.com",
+                 subject="Price change detected",
                  smtp=SmtpConfig(
                      host="smtp.gmail.com",
-                     port=465,
+                     port=587,   # STARTTLS
                      user="you@gmail.com",
                      password="app-password",
                  ),
              ),
          ))
-wd.start()
 ```
 
-Optional fields: `from_` (defaults to `user@host`), `subject` (defaults to `"[WatchDiff] Change detected: {label}"`). Multiple recipients: `to=["a@x.com", "b@x.com"]`.
+### Config file (`watchdiff.config.json`)
 
-Port `465` uses SSL from the start (`SMTP_SSL`). Other ports use `STARTTLS`.
+```json
+{
+  "url": "https://example.com/prices",
+  "email": {
+    "to": "alerts@example.com",
+    "from": "watchdiff@example.com",
+    "subject": "Price change detected",
+    "smtp": {
+      "host": "smtp.gmail.com",
+      "port": 465,
+      "user": "you@gmail.com",
+      "password": "app-password"
+    }
+  }
+}
+```
+
+**Notes:**
+- `from_` defaults to `user@host` when omitted
+- `subject` defaults to `"[WatchDiff] Change detected: {label}"`
+- Multiple recipients: `to=["a@x.com", "b@x.com"]`
+- Port `465` uses SSL from the start (`SMTP_SSL`). All other ports use `STARTTLS`.
 
 ## API reference
 
@@ -1468,6 +1528,7 @@ Register a URL to monitor. All keyword arguments are optional. Returns `self` (c
 | `schedule` | `str \| None` | `None` | 5-field cron expression. Overrides `interval` when set. |
 | `confirm_after` | `int \| None` | `None` | Re-verify after N seconds before alerting (flapping detection) |
 | `json_path` | `str \| None` | `None` | JSON path expression to extract a sub-value before diffing (e.g. `"$.data.price"`) |
+| `email` | `EmailConfig \| None` | `None` | SMTP email alert fired on every detected change — shortcut over building a full `AlertConfig` |
 
 ```python
 # Chainable
@@ -1843,6 +1904,52 @@ server.start()
 server.stop()
 ```
 
+### `EmailConfig` / `SmtpConfig`
+
+```python
+from watchdiff import EmailConfig, SmtpConfig
+
+email = EmailConfig(
+    to="ops@example.com",          # str or list[str]
+    smtp=SmtpConfig(
+        host="smtp.example.com",
+        port=587,
+        user="alerts@example.com",
+        password="secret",
+        secure=None,               # None = auto (SSL on 465, STARTTLS otherwise)
+    ),
+    from_="alerts@example.com",    # optional sender address
+    subject="[WatchDiff] change",  # optional subject override
+)
+```
+
+Pass as `email=` to `.watch()` or inside `AlertConfig(email=...)`.
+
+---
+
+### `SitemapDiffReport` / `SitemapEntry`
+
+Passed to callbacks registered with `.watch_sitemap()`:
+
+```python
+report.sitemap_url   # str — URL of the sitemap
+report.label         # str — human-readable label
+report.added         # list[SitemapEntry] — URLs newly present in the sitemap
+report.removed       # list[SitemapEntry] — URLs no longer in the sitemap
+report.compared_at   # datetime — UTC timestamp of the comparison
+```
+
+Each `SitemapEntry`:
+
+```python
+entry.url            # str
+entry.last_modified  # str | None — <lastmod> value from the sitemap
+entry.change_freq    # str | None — <changefreq> value
+entry.priority       # str | None — <priority> value
+```
+
+---
+
 ### `DbDiffReport`
 
 Returned by `on_change` and `DbDiffEngine.compare()`:
@@ -1980,6 +2087,9 @@ Options for run:
   --alert-if-no-change    Fire silence alert after N seconds without change (0 = off)
   --proxy                 Proxy URL (repeatable)
   --user-agent            User-Agent string (repeatable)
+  --schedule              5-field cron expression — overrides --interval when set
+  --confirm-after         Re-fetch after N seconds before confirming a change (0 = off)
+  --json-path             $.dot.path expression to extract from JSON response before diffing
   --webhook          -w   Webhook URL (repeatable)
   --log-format            Log format: text | json (default text)
   --verbose          -v   Enable debug logging
@@ -2064,6 +2174,9 @@ Every CLI option can be set via environment variable — useful for Docker, CI, 
 | `WATCHDIFF_ALERT_IF_NO_CHANGE` | `--alert-if-no-change` | `86400` |
 | `WATCHDIFF_PROXY` | `--proxy` | `http://proxy:8080` |
 | `WATCHDIFF_USER_AGENT` | `--user-agent` | `MyBot/1.0` |
+| `WATCHDIFF_SCHEDULE` | `--schedule` | `0 9 * * *` |
+| `WATCHDIFF_CONFIRM_AFTER` | `--confirm-after` | `30` |
+| `WATCHDIFF_JSON_PATH` | `--json-path` | `$.data.price` |
 | `WATCHDIFF_TARGET` | `--target` | `.price` |
 | `WATCHDIFF_QUIET` | `--quiet` | `true` |
 | `WATCHDIFF_LOG_FORMAT` | `--log-format` | `json` |

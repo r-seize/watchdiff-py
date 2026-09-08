@@ -5,18 +5,23 @@ WatchDiff - unit tests.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
 from watchdiff.cleaner import Cleaner
+from watchdiff.cron_parser import next_cron_run
 from watchdiff.diff import DiffEngine
 from watchdiff.fetcher import FetchError, Fetcher
-from watchdiff.models import AlertConfig, ChangeType, Snapshot, WatchConfig
+from watchdiff.json_path import extract_json_path
+from watchdiff.mailer import send_email
+from watchdiff.models import AlertConfig, ChangeType, EmailConfig, SmtpConfig, Snapshot, WatchConfig
 from watchdiff.notifier import Notifier
 from watchdiff.parser import Parser
 from watchdiff.scheduler.scheduler import SyncScheduler
+from watchdiff.sitemap import SitemapFetcher
 from watchdiff.store import Store
 
 
@@ -331,3 +336,213 @@ class TestScheduler:
         assert len(statuses) == 1
         assert statuses[0].url == "https://example.com"
         assert not statuses[0].paused
+
+
+# ---------------------------------------------------------------------------
+# Cron parser
+# ---------------------------------------------------------------------------
+
+class TestCronParser:
+    def test_every_minute(self):
+        base = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        nxt  = next_cron_run("* * * * *", from_dt=base)
+        assert nxt.minute == 1
+        assert nxt.hour == 12
+
+    def test_specific_hour_and_minute(self):
+        base = datetime(2024, 6, 15, 8, 0, 0, tzinfo=timezone.utc)
+        nxt  = next_cron_run("30 9 * * *", from_dt=base)
+        assert nxt.hour == 9
+        assert nxt.minute == 30
+
+    def test_step_expression(self):
+        base = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        nxt  = next_cron_run("*/15 * * * *", from_dt=base)
+        assert nxt.minute == 15
+
+    def test_invalid_expression_raises(self):
+        with pytest.raises(ValueError, match="5 fields"):
+            next_cron_run("* * * *")  # only 4 fields
+
+    def test_range_expression(self):
+        base = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        nxt  = next_cron_run("0 9-17 * * *", from_dt=base)
+        assert 9 <= nxt.hour <= 17
+        assert nxt.minute == 0
+
+
+# ---------------------------------------------------------------------------
+# JSON path extraction
+# ---------------------------------------------------------------------------
+
+class TestJsonPath:
+    def test_top_level_key(self):
+        data = json.dumps({"price": "19.99"})
+        assert extract_json_path(data, "$.price") == "19.99"
+
+    def test_nested_key(self):
+        data = json.dumps({"product": {"name": "Widget"}})
+        assert extract_json_path(data, "$.product.name") == "Widget"
+
+    def test_array_index(self):
+        data = json.dumps({"items": ["a", "b", "c"]})
+        assert extract_json_path(data, "$.items[1]") == "b"
+
+    def test_non_string_value_serialised(self):
+        data = json.dumps({"count": 42})
+        assert extract_json_path(data, "$.count") == "42"
+
+    def test_missing_key_returns_original(self):
+        data = json.dumps({"a": 1})
+        assert extract_json_path(data, "$.missing") == data
+
+    def test_invalid_json_returns_original(self):
+        raw = "not json"
+        assert extract_json_path(raw, "$.key") == raw
+
+
+# ---------------------------------------------------------------------------
+# Sitemap fetcher
+# ---------------------------------------------------------------------------
+
+class TestSitemapFetcher:
+    _SIMPLE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/page1</loc><lastmod>2024-01-01</lastmod></url>
+  <url><loc>https://example.com/page2</loc></url>
+</urlset>"""
+
+    _INDEX_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://example.com/sitemap1.xml</loc></sitemap>
+</sitemapindex>"""
+
+    def test_parses_simple_sitemap(self, httpx_mock):
+        httpx_mock.add_response(url="https://example.com/sitemap.xml", text=self._SIMPLE_XML)
+        entries = SitemapFetcher().fetch("https://example.com/sitemap.xml")
+        assert len(entries) == 2
+        assert entries[0].url == "https://example.com/page1"
+        assert entries[0].last_modified == "2024-01-01"
+        assert entries[1].url == "https://example.com/page2"
+
+    def test_handles_sitemap_index(self, httpx_mock):
+        httpx_mock.add_response(url="https://example.com/sitemap-index.xml", text=self._INDEX_XML)
+        httpx_mock.add_response(url="https://example.com/sitemap1.xml", text=self._SIMPLE_XML)
+        entries = SitemapFetcher().fetch("https://example.com/sitemap-index.xml")
+        assert len(entries) == 2
+
+    def test_raises_on_fetch_error(self, httpx_mock):
+        httpx_mock.add_response(url="https://example.com/sitemap.xml", status_code=404)
+        with pytest.raises(RuntimeError, match="Failed to fetch sitemap"):
+            SitemapFetcher().fetch("https://example.com/sitemap.xml")
+
+
+# ---------------------------------------------------------------------------
+# Flapping detection (confirm_after)
+# ---------------------------------------------------------------------------
+
+class TestFlappingDetection:
+    def _config(self, **kwargs) -> WatchConfig:
+        return WatchConfig(url="https://example.com", label="test", **kwargs)
+
+    def _snap(self, content: str) -> Snapshot:
+        return Snapshot(url="https://example.com", target=None, content=content, raw_html="")
+
+    def test_confirm_after_suppresses_transient_change(self, httpx_mock):
+        # First call returns changed content, second call returns original (reverted)
+        httpx_mock.add_response(url="https://example.com", status_code=200,
+                                text="<html><body>Changed</body></html>")
+        httpx_mock.add_response(url="https://example.com", status_code=200,
+                                text="<html><body>Original</body></html>")
+
+        previous = self._snap("Original")
+        store    = MagicMock()
+        store.load_latest.return_value = previous
+
+        with patch("watchdiff.scheduler.scheduler.time.sleep"):
+            scheduler = SyncScheduler(store)
+            report    = scheduler.check_once(self._config(confirm_after=5))
+
+        # Change was detected but then reverted — report returned but no alert
+        assert report is not None
+
+    def test_confirm_after_allows_stable_change(self, httpx_mock):
+        # Both calls return changed content → change is confirmed
+        httpx_mock.add_response(url="https://example.com", status_code=200,
+                                text="<html><body>New price: 99€</body></html>")
+        httpx_mock.add_response(url="https://example.com", status_code=200,
+                                text="<html><body>New price: 99€</body></html>")
+
+        previous = self._snap("Old price: 49€")
+        store    = MagicMock()
+        store.load_latest.return_value = previous
+
+        with patch("watchdiff.scheduler.scheduler.time.sleep"):
+            scheduler = SyncScheduler(store)
+            report    = scheduler.check_once(self._config(confirm_after=5))
+
+        assert report is not None
+        assert report.has_changes
+
+
+# ---------------------------------------------------------------------------
+# Email alert
+# ---------------------------------------------------------------------------
+
+class TestEmailAlert:
+    def _make_report(self):
+        before = Snapshot(url="https://example.com", target=None, content="Hello", raw_html="")
+        after  = Snapshot(url="https://example.com", target=None, content="Hello World", raw_html="")
+        return DiffEngine().compare(before, after, WatchConfig(url="https://example.com", label="test"))
+
+    def _email_config(self) -> EmailConfig:
+        return EmailConfig(
+            to      = "dest@example.com",
+            from_   = "sender@example.com",
+            subject = "Test alert",
+            smtp    = SmtpConfig(
+                host="smtp.example.com", port=587,
+                user="user", password="pass", secure=False,
+            ),
+        )
+
+    def test_send_email_uses_starttls_on_port_587(self):
+        report = self._make_report()
+        cfg    = self._email_config()
+
+        mock_server = MagicMock()
+        with patch("smtplib.SMTP", return_value=mock_server) as mock_smtp:
+            mock_smtp.return_value.__enter__ = lambda s: mock_server
+            mock_smtp.return_value.__exit__  = MagicMock(return_value=False)
+            send_email(cfg, report)
+
+        mock_server.starttls.assert_called_once()
+        mock_server.login.assert_called_once_with("user", "pass")
+        mock_server.sendmail.assert_called_once()
+
+    def test_send_email_uses_ssl_on_port_465(self):
+        report = self._make_report()
+        cfg    = EmailConfig(
+            to   = "dest@example.com",
+            smtp = SmtpConfig(
+                host="smtp.example.com", port=465,
+                user="user", password="pass",
+            ),
+        )
+
+        mock_server = MagicMock()
+        with patch("smtplib.SMTP_SSL", return_value=mock_server) as mock_smtp_ssl:
+            mock_smtp_ssl.return_value.__enter__ = lambda s: mock_server
+            mock_smtp_ssl.return_value.__exit__  = MagicMock(return_value=False)
+            send_email(cfg, report)
+
+        mock_server.login.assert_called_once_with("user", "pass")
+        mock_server.sendmail.assert_called_once()
+
+    def test_notifier_triggers_email_on_change(self):
+        report = self._make_report()
+        alert  = AlertConfig(email=self._email_config())
+
+        with patch("watchdiff.mailer.send_email") as mock_send:
+            Notifier().notify(report, alert)
+            mock_send.assert_called_once_with(alert.email, report)

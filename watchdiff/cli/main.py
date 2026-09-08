@@ -139,6 +139,23 @@ def _validate_config(data: dict[str, Any], path: Path) -> None:
         if headers is not None and not isinstance(headers, dict):
             errors.append(f"{prefix}.headers: must be an object (got {type(headers).__name__})")
 
+        schedule = w.get("schedule")
+        if schedule is not None:
+            parts = str(schedule).strip().split()
+            if len(parts) != 5:
+                errors.append(
+                    f"{prefix}.schedule: must be a 5-field cron expression "
+                    f"(e.g. '*/5 * * * *') — got {schedule!r}"
+                )
+
+        confirm_after = w.get("confirm_after")
+        if confirm_after is not None and (not isinstance(confirm_after, (int, float)) or float(confirm_after) < 0):
+            errors.append(f"{prefix}.confirm_after: must be a non-negative number (got {confirm_after!r})")
+
+        json_path = w.get("json_path")
+        if json_path is not None and not isinstance(json_path, str):
+            errors.append(f"{prefix}.json_path: must be a string (got {type(json_path).__name__})")
+
     if errors:
         _exit_with_config_errors(errors, path)
 
@@ -192,6 +209,10 @@ def cmd_init(
                 "ignore_patterns":          [],
                 "timeout":                  15,
                 "headers":                  {},
+                "schedule":                 None,
+                "confirm_after":            None,
+                "json_path":               None,
+                "email":                    None,
             }
         ],
     }
@@ -273,6 +294,15 @@ def cmd_run(
     user_agent: list[str] = typer.Option([], "--user-agent",
                                            help="User-Agent string (repeatable).",
                                            envvar="WATCHDIFF_USER_AGENT"),
+    schedule: str | None  = typer.Option(None, "--schedule",
+                                           help="5-field cron expression (overrides --interval).",
+                                           envvar="WATCHDIFF_SCHEDULE"),
+    confirm_after: int    = typer.Option(0, "--confirm-after",
+                                           help="Re-fetch after N seconds before confirming change (0 = off).",
+                                           envvar="WATCHDIFF_CONFIRM_AFTER"),
+    json_path: str | None = typer.Option(None, "--json-path",
+                                           help="$.dot.path expression to extract from JSON response before diffing.",
+                                           envvar="WATCHDIFF_JSON_PATH"),
     config_file: str | None = typer.Option(None, "--config", "-c",
                                            help="Load watchers from a JSON config file."),
 ) -> None:
@@ -318,6 +348,9 @@ def cmd_run(
         alert_if_no_change_after = alert_if_no_change or None,
         proxies                  = proxy or [],
         user_agents              = user_agent or [],
+        schedule                 = schedule or None,
+        confirm_after            = confirm_after or None,
+        json_path                = json_path or None,
     )
     wd.on_change(_print_report)
 
@@ -799,7 +832,7 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
         console.print("[yellow]No watchers defined in config file.[/]")
         raise typer.Exit(0)
 
-    from watchdiff.models import BrowserOptions  # noqa: PLC0415
+    from watchdiff.models import BrowserOptions, EmailConfig, SmtpConfig  # noqa: PLC0415
 
     wd = WatchDiff(storage_dir=storage)
     for w in watchers:
@@ -810,6 +843,24 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
                 wait_for          = raw_bo.get("wait_for", "load"),
                 wait_for_selector = raw_bo.get("wait_for_selector"),
                 timeout           = raw_bo.get("timeout", 30000),
+            )
+
+        email_cfg = None
+        raw_email = w.get("email")
+        if raw_email:
+            raw_smtp = raw_email.get("smtp", {})
+            smtp = SmtpConfig(
+                host     = raw_smtp.get("host", ""),
+                port     = int(raw_smtp.get("port", 587)),
+                user     = raw_smtp.get("user", ""),
+                password = raw_smtp.get("password", ""),
+                secure   = raw_smtp.get("secure"),
+            )
+            email_cfg = EmailConfig(
+                to      = raw_email.get("to", ""),
+                smtp    = smtp,
+                from_   = raw_email.get("from"),
+                subject = raw_email.get("subject"),
             )
 
         wd.watch(
@@ -838,6 +889,10 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
             ignore_numbers           = w.get("ignore_numbers", False),
             alert_if_no_change_after = w.get("alert_if_no_change_after"),
             alert_on_status_change   = w.get("alert_on_status_change", False),
+            schedule                 = w.get("schedule"),
+            confirm_after            = w.get("confirm_after"),
+            json_path                = w.get("json_path"),
+            email                    = email_cfg,
         )
 
     wd.on_change(on_change_cb)  # type: ignore[arg-type]
