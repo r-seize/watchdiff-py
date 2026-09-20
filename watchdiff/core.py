@@ -37,10 +37,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from watchdiff.models import (
+    ActiveBetween,
     AlertConfig,
     BrowserOptions,
     DiffReport,
     EmailConfig,
+    FailurePolicy,
+    MaintenanceWindow,
     SilenceInfo,
     SpikeInfo,
     StatusChangeInfo,
@@ -66,6 +69,7 @@ class WatchDiff:
         self,
         storage_dir: str | Path = ".watchdiff",
         store: Any | None = None,
+        concurrency: int | None = None,
     ) -> None:
         """
         Args:
@@ -74,6 +78,7 @@ class WatchDiff:
                          When provided, storage_dir is ignored.
         """
         self._store: Any                                           = store if store is not None else Store(storage_dir)
+        self._concurrency: int | None                              = concurrency
         self._configs: list[WatchConfig]                           = []
         self._db_configs: list[Any]                                = []
         self._cert_configs: list[Any]                              = []
@@ -140,6 +145,10 @@ class WatchDiff:
         confirm_after: int | None                                                              = None,
         json_path: str | None                                                                  = None,
         email: EmailConfig | None                                                              = None,
+        id: str | None                                                                         = None,
+        maintenance_windows: list[MaintenanceWindow] | None                                    = None,
+        active_between: ActiveBetween | None                                                   = None,
+        failure_policy: FailurePolicy | None                                                   = None,
     ) -> WatchDiff:
         """
         Register a URL to monitor.
@@ -235,6 +244,10 @@ class WatchDiff:
             schedule                 = schedule,
             confirm_after            = confirm_after,
             json_path                = json_path,
+            id                       = id,
+            maintenance_windows      = maintenance_windows or [],
+            active_between           = active_between,
+            failure_policy           = failure_policy,
         )
         self._configs.append(config)
         return self
@@ -562,7 +575,7 @@ class WatchDiff:
             return
 
         if has_urls:
-            scheduler = SyncScheduler(self._store)
+            scheduler = SyncScheduler(self._store, concurrency=self._concurrency)
             self._scheduler = scheduler
             for cb in self._global_callbacks:
                 scheduler.add_global_callback(cb)
@@ -609,7 +622,7 @@ class WatchDiff:
         coros = []
 
         if has_urls:
-            scheduler = AsyncScheduler(self._store)
+            scheduler = AsyncScheduler(self._store, concurrency=self._concurrency)
             self._async_scheduler = scheduler
             for cb in self._global_callbacks:
                 scheduler.add_global_callback(cb)

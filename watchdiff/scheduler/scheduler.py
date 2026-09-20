@@ -53,13 +53,14 @@ class SyncScheduler:
     sleep interval, so different URLs can have different cadences.
     """
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, concurrency: int | None = None) -> None:
         self._store                                                  = store
         self._fetcher                                                = Fetcher()
         self._browser_fetcher: Any                                   = None  # lazy-init on first browser use
         self._parser                                                 = Parser()
         self._engine                                                 = DiffEngine()
         self._notifier                                               = Notifier()
+        self._semaphore: threading.Semaphore | None                  = threading.Semaphore(concurrency) if concurrency else None
         self._on_diff_callbacks: list[Callable[[DiffReport], None]] = []
         self._threads: list[threading.Thread]                        = []
         self._stop_events: list[threading.Event]                     = []
@@ -78,6 +79,10 @@ class SyncScheduler:
         self._last_spike_at: dict[str, float]                        = {}
         self._last_status_code: dict[str, int]                       = {}
         self._ai_disabled: set[str]                                  = set()
+        self._consecutive_failures: dict[str, int]                   = {}
+        self._consecutive_successes: dict[str, int]                  = {}
+        self._in_failure_mode: dict[str, bool]                       = {}
+        self._retry_after_delay: dict[str, float]                    = {}
 
     def add_global_callback(self, callback: Callable[[DiffReport], None]) -> None:
         """Register a callback called for every DiffReport (regardless of config)."""
@@ -119,15 +124,15 @@ class SyncScheduler:
             event.set()
         logger.info("Stopping all watchers.")
 
-    def pause(self, url: str) -> None:
-        """Suspend the watcher for a URL (checks are skipped until resume)."""
-        self._paused.add(url)
-        logger.info("Paused watcher for %s", url)
+    def pause(self, id_or_url: str) -> None:
+        """Suspend a watcher by its id (if set) or URL."""
+        self._paused.add(id_or_url)
+        logger.info("Paused watcher %s", id_or_url)
 
-    def resume(self, url: str) -> None:
-        """Resume a paused watcher."""
-        self._paused.discard(url)
-        logger.info("Resumed watcher for %s", url)
+    def resume(self, id_or_url: str) -> None:
+        """Resume a paused watcher by its id (if set) or URL."""
+        self._paused.discard(id_or_url)
+        logger.info("Resumed watcher %s", id_or_url)
 
     def status(self) -> list[WatcherStatus]:
         """Return a live status snapshot for all registered watchers."""
@@ -142,7 +147,7 @@ class SyncScheduler:
                 label          = config.label or config.url,
                 target         = config.target,
                 interval       = config.interval,
-                paused         = config.url in self._paused,
+                paused         = _watcher_key(config) in self._paused,
                 last_check_at  = datetime.fromtimestamp(last_check, tz=timezone.utc) if last_check else None,
                 next_check_at  = datetime.fromtimestamp(next_check, tz=timezone.utc) if next_check else None,
                 last_change_at = datetime.fromtimestamp(last_change, tz=timezone.utc) if last_change else None,
@@ -150,6 +155,8 @@ class SyncScheduler:
                 changes_count     = self._changes_count.get(key, 0),
                 errors_count      = self._errors_count.get(key, 0),
                 last_status_code  = self._last_status_code.get(key, 0),
+                id             = getattr(config, "id", None),
+                in_maintenance = _in_maintenance(config),
             ))
         return result
 
@@ -174,14 +181,25 @@ class SyncScheduler:
         self._last_status_code[key]    = 0
 
         while not stop_event.is_set():
-            if config.url not in self._paused:
-                self._check(config)
+            if _watcher_key(config) not in self._paused:
+                if _in_maintenance(config):
+                    logger.debug("[%s] Skipping check — in maintenance window.", config.label)
+                elif not _in_active_hours(config):
+                    logger.debug("[%s] Skipping check — outside active hours.", config.label)
+                elif self._semaphore is not None:
+                    with self._semaphore:
+                        self._check(config)
+                else:
+                    self._check(config)
 
+            retry_after = self._retry_after_delay.pop(key, None)
             if getattr(config, "schedule", None):
                 from watchdiff.cron_parser import next_cron_run  # noqa: PLC0415
                 from datetime import datetime, timezone  # noqa: PLC0415
                 next_dt  = next_cron_run(config.schedule)
                 delay    = max(1.0, (next_dt - datetime.now(timezone.utc)).total_seconds())
+                if retry_after:
+                    delay = max(delay, retry_after)
                 self._next_check_at[key] = time.time() + delay
                 stop_event.wait(timeout=delay)
             else:
@@ -189,6 +207,8 @@ class SyncScheduler:
                 if config.jitter > 0:
                     delta     = config.interval * config.jitter * random.uniform(-1, 1)
                     effective = max(1.0, effective + delta)
+                if retry_after:
+                    effective = max(effective, retry_after)
                 self._next_check_at[key] = time.time() + effective
                 stop_event.wait(timeout=effective)
 
@@ -213,10 +233,26 @@ class SyncScheduler:
         if config.ignore_numbers:
             extra_patterns.append(r"\b\d+(\.\d+)?\b")
 
+        policy = getattr(config, "failure_policy", None)
         t0 = time.monotonic() if getattr(config, "track_response_time", False) else None
         try:
             html = self._fetch(config)
         except Exception as exc:  # noqa: BLE001
+            consec = self._consecutive_failures.get(key, 0) + 1
+            self._consecutive_failures[key] = consec
+            self._consecutive_successes[key] = 0
+            if policy:
+                if policy.respect_retry_after:
+                    ra = getattr(exc, "retry_after", None)
+                    if ra:
+                        self._retry_after_delay[key] = float(ra)
+                if consec < policy.consecutive_failures:
+                    logger.debug("[%s] Failure %d/%d — suppressed by failure_policy", config.label, consec, policy.consecutive_failures)
+                    return None
+                if consec > policy.consecutive_failures and self._in_failure_mode.get(key, False):
+                    logger.debug("[%s] In failure mode (%d consecutive) — alert suppressed", config.label, consec)
+                    return None
+                self._in_failure_mode[key] = True
             self._errors_count[key] = self._errors_count.get(key, 0) + 1
             logger.error("[%s] Fetch failed: %s", config.label, exc)
             current_status = getattr(exc, "status_code", 0)
@@ -227,6 +263,20 @@ class SyncScheduler:
                 except Exception as cb_exc:  # noqa: BLE001
                     logger.warning("[%s] on_error callback error: %s", config.label, cb_exc)
             return None
+
+        # Successful fetch — handle recovery if in failure mode
+        if self._in_failure_mode.get(key, False):
+            self._consecutive_failures[key] = 0
+            consec_ok = self._consecutive_successes.get(key, 0) + 1
+            self._consecutive_successes[key] = consec_ok
+            if policy and consec_ok < policy.recovery_checks:
+                logger.debug("[%s] Recovery check %d/%d", config.label, consec_ok, policy.recovery_checks)
+                return None
+            self._in_failure_mode[key] = False
+            self._consecutive_successes[key] = 0
+            logger.info("[%s] Recovered after %d check(s)", config.label, consec_ok)
+        else:
+            self._consecutive_failures[key] = 0
 
         response_time_ms = (time.monotonic() - t0) * 1000 if t0 is not None else None
 
@@ -543,13 +593,14 @@ class AsyncScheduler:
     Use this inside async applications (FastAPI, aiohttp, etc.).
     """
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, concurrency: int | None = None) -> None:
         self._store                                                  = store
         self._fetcher                                                = AsyncFetcher()
         self._browser_fetcher: Any                                   = None  # lazy-init on first browser use
         self._parser                                                 = Parser()
         self._engine                                                 = DiffEngine()
         self._notifier                                               = Notifier()
+        self._semaphore: asyncio.Semaphore | None                    = asyncio.Semaphore(concurrency) if concurrency else None
         self._on_diff_callbacks: list[Callable[[DiffReport], None]] = []
         self._configs: list[WatchConfig]                             = []
         self._paused: set[str]                                       = set()
@@ -566,6 +617,10 @@ class AsyncScheduler:
         self._last_spike_at: dict[str, float]                        = {}
         self._last_status_code: dict[str, int]                       = {}
         self._ai_disabled: set[str]                                  = set()
+        self._consecutive_failures: dict[str, int]                   = {}
+        self._consecutive_successes: dict[str, int]                  = {}
+        self._in_failure_mode: dict[str, bool]                       = {}
+        self._retry_after_delay: dict[str, float]                    = {}
 
     def add_global_callback(self, callback: Callable[[DiffReport], None]) -> None:
         self._on_diff_callbacks.append(callback)
@@ -576,15 +631,15 @@ class AsyncScheduler:
         tasks = [asyncio.create_task(self._run_loop(cfg)) for cfg in configs]
         await asyncio.gather(*tasks)
 
-    def pause(self, url: str) -> None:
-        """Suspend the watcher for a URL."""
-        self._paused.add(url)
-        logger.info("Paused watcher for %s", url)
+    def pause(self, id_or_url: str) -> None:
+        """Suspend a watcher by its id (if set) or URL."""
+        self._paused.add(id_or_url)
+        logger.info("Paused watcher %s", id_or_url)
 
-    def resume(self, url: str) -> None:
-        """Resume a paused watcher."""
-        self._paused.discard(url)
-        logger.info("Resumed watcher for %s", url)
+    def resume(self, id_or_url: str) -> None:
+        """Resume a paused watcher by its id (if set) or URL."""
+        self._paused.discard(id_or_url)
+        logger.info("Resumed watcher %s", id_or_url)
 
     def status(self) -> list[WatcherStatus]:
         """Return a live status snapshot for all registered watchers."""
@@ -599,7 +654,7 @@ class AsyncScheduler:
                 label          = config.label or config.url,
                 target         = config.target,
                 interval       = config.interval,
-                paused         = config.url in self._paused,
+                paused         = _watcher_key(config) in self._paused,
                 last_check_at  = datetime.fromtimestamp(last_check, tz=timezone.utc) if last_check else None,
                 next_check_at  = datetime.fromtimestamp(next_check, tz=timezone.utc) if next_check else None,
                 last_change_at = datetime.fromtimestamp(last_change, tz=timezone.utc) if last_change else None,
@@ -607,6 +662,8 @@ class AsyncScheduler:
                 changes_count     = self._changes_count.get(key, 0),
                 errors_count      = self._errors_count.get(key, 0),
                 last_status_code  = self._last_status_code.get(key, 0),
+                id             = getattr(config, "id", None),
+                in_maintenance = _in_maintenance(config),
             ))
         return result
 
@@ -626,13 +683,24 @@ class AsyncScheduler:
         self._last_status_code[key]    = 0
 
         while True:
-            if config.url not in self._paused:
-                await self._check(config)
+            if _watcher_key(config) not in self._paused:
+                if _in_maintenance(config):
+                    logger.debug("[%s] Skipping check — in maintenance window.", config.label)
+                elif not _in_active_hours(config):
+                    logger.debug("[%s] Skipping check — outside active hours.", config.label)
+                elif self._semaphore is not None:
+                    async with self._semaphore:
+                        await self._check(config)
+                else:
+                    await self._check(config)
 
+            retry_after = self._retry_after_delay.pop(key, None)
             if getattr(config, "schedule", None):
                 from watchdiff.cron_parser import next_cron_run  # noqa: PLC0415
                 next_dt  = next_cron_run(config.schedule)
                 delay    = max(1.0, (next_dt - datetime.now(timezone.utc)).total_seconds())
+                if retry_after:
+                    delay = max(delay, retry_after)
                 self._next_check_at[key] = time.time() + delay
                 await asyncio.sleep(delay)
             else:
@@ -640,6 +708,8 @@ class AsyncScheduler:
                 if config.jitter > 0:
                     delta     = config.interval * config.jitter * random.uniform(-1, 1)
                     effective = max(1.0, effective + delta)
+                if retry_after:
+                    effective = max(effective, retry_after)
                 self._next_check_at[key] = time.time() + effective
                 await asyncio.sleep(effective)
 
@@ -664,10 +734,26 @@ class AsyncScheduler:
         if config.ignore_numbers:
             extra_patterns.append(r"\b\d+(\.\d+)?\b")
 
+        policy = getattr(config, "failure_policy", None)
         t0 = time.monotonic() if getattr(config, "track_response_time", False) else None
         try:
             html = await self._fetch(config)
         except Exception as exc:  # noqa: BLE001
+            consec = self._consecutive_failures.get(key, 0) + 1
+            self._consecutive_failures[key] = consec
+            self._consecutive_successes[key] = 0
+            if policy:
+                if policy.respect_retry_after:
+                    ra = getattr(exc, "retry_after", None)
+                    if ra:
+                        self._retry_after_delay[key] = float(ra)
+                if consec < policy.consecutive_failures:
+                    logger.debug("[%s] Failure %d/%d — suppressed by failure_policy", config.label, consec, policy.consecutive_failures)
+                    return None
+                if consec > policy.consecutive_failures and self._in_failure_mode.get(key, False):
+                    logger.debug("[%s] In failure mode (%d consecutive) — alert suppressed", config.label, consec)
+                    return None
+                self._in_failure_mode[key] = True
             self._errors_count[key] = self._errors_count.get(key, 0) + 1
             logger.error("[%s] Fetch failed: %s", config.label, exc)
             current_status = getattr(exc, "status_code", 0)
@@ -678,6 +764,20 @@ class AsyncScheduler:
                 except Exception as cb_exc:  # noqa: BLE001
                     logger.warning("[%s] on_error callback error: %s", config.label, cb_exc)
             return None
+
+        # Successful fetch — handle recovery if in failure mode
+        if self._in_failure_mode.get(key, False):
+            self._consecutive_failures[key] = 0
+            consec_ok = self._consecutive_successes.get(key, 0) + 1
+            self._consecutive_successes[key] = consec_ok
+            if policy and consec_ok < policy.recovery_checks:
+                logger.debug("[%s] Recovery check %d/%d", config.label, consec_ok, policy.recovery_checks)
+                return None
+            self._in_failure_mode[key] = False
+            self._consecutive_successes[key] = 0
+            logger.info("[%s] Recovered after %d check(s)", config.label, consec_ok)
+        else:
+            self._consecutive_failures[key] = 0
 
         response_time_ms = (time.monotonic() - t0) * 1000 if t0 is not None else None
 
@@ -993,3 +1093,47 @@ class AsyncScheduler:
 
 def _cooldown_key(config: WatchConfig) -> str:
     return f"{config.url}::{config.target or ''}"
+
+
+def _watcher_key(config: WatchConfig) -> str:
+    """Stable identity key used for pause/resume — prefers config.id over URL."""
+    return getattr(config, "id", None) or config.url
+
+
+def _in_maintenance(config: WatchConfig) -> bool:
+    """Return True if now falls inside any maintenance window."""
+    windows = getattr(config, "maintenance_windows", None)
+    if not windows:
+        return False
+    now = datetime.now(timezone.utc)
+    for w in windows:
+        if w.from_ <= now <= w.to:  # type: ignore[operator]
+            return True
+    return False
+
+
+def _in_active_hours(config: WatchConfig) -> bool:
+    """Return True if now is within the configured active_between window."""
+    ab = getattr(config, "active_between", None)
+    if ab is None:
+        return True
+    try:
+        from zoneinfo import ZoneInfo  # noqa: PLC0415
+        tz = ZoneInfo(ab.timezone) if ab.timezone else timezone.utc
+    except Exception:  # noqa: BLE001
+        tz = timezone.utc
+    now_local = datetime.now(tz)
+    from_h, from_m = map(int, ab.from_.split(":"))
+    to_h, to_m     = map(int, ab.to.split(":"))
+    current_min    = now_local.hour * 60 + now_local.minute
+    from_min       = from_h * 60 + from_m
+    to_min         = to_h   * 60 + to_m
+    if to_min <= from_min:
+        in_window = current_min >= from_min or current_min < to_min
+    else:
+        in_window = from_min <= current_min < to_min
+    if not in_window:
+        return False
+    if ab.days is not None and now_local.weekday() not in ab.days:
+        return False
+    return True

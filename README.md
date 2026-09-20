@@ -44,6 +44,11 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 | Monitor a sitemap for URL changes | `.watch_sitemap("https://example.com/sitemap.xml")` |
 | Watch one JSON field only | `json_path="$.data.price"` |
 | Monitor authenticated pages | `cookies={"session": "abc123", "csrftoken": "xyz"}` |
+| Give a watcher a stable ID | `id="product-price"` — use ID instead of URL in `.pause()`/`.resume()` |
+| Limit concurrent checks | `WatchDiff(concurrency=5)` — cap parallel fetch workers |
+| Skip checks during downtime | `maintenance_windows=[MaintenanceWindow(from_="2026-01-15T02:00Z", to="2026-01-15T04:00Z")]` |
+| Restrict checks to business hours | `active_between=ActiveBetween(from_="09:00", to="17:00", days=[0,1,2,3,4], timezone="Europe/Paris")` |
+| Suppress noisy error alerts | `failure_policy=FailurePolicy(consecutive_failures=3, recovery_checks=2)` |
 | Send email on change | `alert=AlertConfig(email=EmailConfig(to="...", smtp=SmtpConfig(...)))` |
 | AI summary of changes | `ai_summary=True, ai_provider=AiProvider(type="gemini", api_key="...")` |
 | Customize the AI prompt | `ai_prompt="Summarize in French."` or `ai_prompt=lambda r: ...` |
@@ -101,6 +106,11 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [JSON path targeting](#json-path-targeting)
   - [Cookie-based authentication](#cookie-based-authentication)
   - [Email alerts](#email-alerts)
+  - [Watcher ID](#watcher-id)
+  - [Concurrency limiting](#concurrency-limiting)
+  - [Maintenance windows](#maintenance-windows)
+  - [Active hours](#active-hours)
+  - [Failure policy](#failure-policy)
 - [API reference](#api-reference)
   - [`.watch()`](#watchurl--)
   - [`.watch_db()`](#watch_dbconnection_string-table--)
@@ -127,6 +137,9 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [`StatusServer`](#statusserver)
   - [`EmailConfig` / `SmtpConfig`](#emailconfig--smtpconfig)
   - [`SitemapDiffReport` / `SitemapEntry`](#sitemapdifreport--sitemapentry)
+  - [`MaintenanceWindow`](#maintenancewindow)
+  - [`ActiveBetween`](#activebetween)
+  - [`FailurePolicy`](#failurepolicy)
   - [`DbDiffReport`](#dbdiffreport)
   - [`DbChange`](#dbchange)
   - [`DbWatcherStatus`](#dbwatcherstatus)
@@ -258,6 +271,9 @@ watchdiff db "postgresql://user:pass@localhost/mydb" products \
 ```bash
 # Generate a config file
 watchdiff init
+
+# Validate a config file without starting watchers
+watchdiff validate watchdiff.config.json
 
 # Run from config file
 watchdiff run --config watchdiff.config.json
@@ -1055,7 +1071,11 @@ Edit `watchdiff.config.json`:
       "schedule": null,
       "confirm_after": null,
       "json_path": null,
-      "email": null
+      "email": null,
+      "id": null,
+      "maintenance_windows": [],
+      "active_between": null,
+      "failure_policy": null
     },
     {
       "url": "https://hnrss.org/frontpage",
@@ -1463,6 +1483,119 @@ wd.watch("https://example.com/prices",
 - Multiple recipients: `to=["a@x.com", "b@x.com"]`
 - Port `465` uses SSL from the start (`SMTP_SSL`). All other ports use `STARTTLS`.
 
+## Watcher ID
+
+Assign a stable string identifier to any watcher. The ID is used instead of the URL for `.pause()`, `.resume()`, and `.status()` lookups, which is useful when two watchers share the same URL or when you want readable keys in your control code.
+
+```python
+from watchdiff import WatchDiff
+
+wd = WatchDiff()
+wd.watch("https://example.com/prices", id="product-price", interval=60)
+wd.watch("https://example.com/prices", id="product-price-2", interval=120)
+
+wd.pause("product-price")   # pause by ID, not URL
+wd.resume("product-price")
+```
+
+Without `id`, `pause(url)` pauses **all** watchers registered for that URL. With `id`, each watcher is independent and can be paused or resumed individually.
+
+IDs also appear in `WatcherStatus.id` and in the JSON returned by `status()`.
+
+## Concurrency limiting
+
+Cap the number of checks that run simultaneously. Without a limit all watchers fire in parallel; with a limit the scheduler queues excess checks.
+
+```python
+wd = WatchDiff(concurrency=5)  # at most 5 simultaneous fetches
+```
+
+Useful when you monitor hundreds of URLs and want to avoid hammering a shared proxy pool or saturating a network interface.
+
+## Maintenance windows
+
+Skip checks during a known downtime window. Checks resume automatically once the window closes.
+
+```python
+from watchdiff import WatchDiff, MaintenanceWindow
+
+wd = WatchDiff()
+wd.watch(
+    "https://api.example.com/health",
+    interval=60,
+    maintenance_windows=[
+        MaintenanceWindow(
+            from_="2026-02-01T02:00:00+00:00",  # ISO 8601 UTC start
+            to="2026-02-01T04:00:00+00:00",       # UTC end
+        ),
+    ],
+)
+wd.start()
+```
+
+- `from_` and `to` accept either an ISO 8601 string or a `datetime` object.
+- Multiple windows can be listed; any overlapping window suppresses the check.
+- The window is evaluated fresh on each tick — no restart needed after the window passes.
+- `WatcherStatus.in_maintenance` reflects the current state.
+
+## Active hours
+
+Restrict checks to specific hours and/or days. Checks outside the window are silently skipped until the next window opens.
+
+```python
+from watchdiff import WatchDiff, ActiveBetween
+
+wd = WatchDiff()
+wd.watch(
+    "https://example.com/prices",
+    interval=60,
+    active_between=ActiveBetween(
+        from_="09:00",   # "HH:MM" — start of active window
+        to="17:00",      # "HH:MM" — end of active window
+        days=[0, 1, 2, 3, 4],   # Mon–Fri (0=Monday, 6=Sunday). None = every day
+        timezone="Europe/Paris", # IANA timezone name. None = UTC
+    ),
+)
+wd.start()
+```
+
+- `to` before `from_` (e.g. `from_="22:00"`, `to="06:00"`) is treated as an overnight window.
+- `days` defaults to all 7 days when omitted. `timezone` defaults to UTC when omitted.
+- Requires Python 3.9+ `zoneinfo` stdlib. Falls back to UTC if the IANA database is unavailable.
+- **Note:** the Python API uses integer weekday indices (`0`=Monday … `6`=Sunday, matching `datetime.weekday()`). The TypeScript port uses string names (`"monday"`, `"friday"`, …).
+
+## Failure policy
+
+Gate the `on_error` callback until a URL has failed a configurable number of times in a row, and require a configurable number of consecutive successes before considering it recovered. Reduces alert noise from transient blips.
+
+```python
+from watchdiff import WatchDiff, FailurePolicy
+
+wd = WatchDiff()
+wd.watch(
+    "https://example.com/status",
+    interval=30,
+    failure_policy=FailurePolicy(
+        consecutive_failures=3,   # only fire on_error after 3 failures in a row
+        recovery_checks=2,        # require 2 consecutive successes to clear the failure state
+        respect_retry_after=True, # honour Retry-After response header when present
+    ),
+    on_error=lambda exc, cfg: print(f"Confirmed failure: {exc}"),
+)
+wd.start()
+```
+
+Without `failure_policy`, the first fetch error fires `on_error` immediately. With it:
+
+- Errors below the threshold are silently swallowed — no callback, no alert.
+- After `consecutive_failures` errors in a row, `on_error` fires **once**, then is suppressed until recovery.
+- Recovery requires `recovery_checks` consecutive successful fetches.
+- When `respect_retry_after=True` and the server returns a `Retry-After` header (e.g. on 429/503), the next check is postponed until the header deadline.
+
+Default: `consecutive_failures=3`, `recovery_checks=1`, `respect_retry_after=False`.
+
+> **Note:** the TypeScript port defaults `consecutiveFailures` to **1** (fire on the first error). Python defaults to **3**. A bare `FailurePolicy()` therefore behaves differently across the two implementations.
+
 ## API reference
 
 ### `WatchDiff`
@@ -1474,7 +1607,14 @@ from watchdiff.store import SqliteStore
 wd = WatchDiff()                               # JSON store in .watchdiff/
 wd = WatchDiff(storage_dir="/data/watchdiff")  # custom JSON store path
 wd = WatchDiff(store=SqliteStore("db.sqlite")) # SQLite store
+wd = WatchDiff(concurrency=5)                  # at most 5 parallel fetch workers
 ```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `storage_dir` | `str` | `".watchdiff"` | Directory for JSON snapshot/report files |
+| `store` | `Store \| None` | `None` | Custom store implementation (e.g. `SqliteStore`) |
+| `concurrency` | `int \| None` | `None` | Max simultaneous check workers. `None` = unlimited |
 
 #### `.watch(url, *, ...)`
 
@@ -1529,6 +1669,10 @@ Register a URL to monitor. All keyword arguments are optional. Returns `self` (c
 | `confirm_after` | `int \| None` | `None` | Re-verify after N seconds before alerting (flapping detection) |
 | `json_path` | `str \| None` | `None` | JSON path expression to extract a sub-value before diffing (e.g. `"$.data.price"`) |
 | `email` | `EmailConfig \| None` | `None` | SMTP email alert fired on every detected change — shortcut over building a full `AlertConfig` |
+| `id` | `str \| None` | `None` | Stable identifier for this watcher — used instead of URL in `.pause()`/`.resume()` |
+| `maintenance_windows` | `list[MaintenanceWindow]` | `[]` | One-time UTC time ranges during which checks are skipped |
+| `active_between` | `ActiveBetween \| None` | `None` | Restrict checks to a recurring daily/weekly time window |
+| `failure_policy` | `FailurePolicy \| None` | `None` | Gate `on_error` until N consecutive failures; require M consecutive successes to recover |
 
 ```python
 # Chainable
@@ -1836,6 +1980,8 @@ status.checks_count    # int
 status.changes_count   # int
 status.errors_count    # int
 status.last_status_code # int — last known HTTP status (0 = unknown)
+status.id               # str | None — stable watcher ID (set via id= on .watch())
+status.in_maintenance   # bool — True if currently inside a maintenance window
 
 status.as_dict()       # JSON-serialisable dict
 ```
@@ -1950,6 +2096,82 @@ entry.priority       # str | None — <priority> value
 
 ---
 
+### `MaintenanceWindow`
+
+Defines a one-time UTC window during which checks are paused:
+
+```python
+from watchdiff import MaintenanceWindow
+from datetime import datetime, timezone
+
+# From ISO 8601 strings (recommended)
+w = MaintenanceWindow(
+    from_="2026-02-01T02:00:00+00:00",
+    to="2026-02-01T04:00:00+00:00",
+)
+
+# From datetime objects
+w = MaintenanceWindow(
+    from_=datetime(2026, 2, 1, 2, 0, tzinfo=timezone.utc),
+    to=datetime(2026, 2, 1, 4, 0, tzinfo=timezone.utc),
+)
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `from_` | `datetime \| str` | UTC start; ISO 8601 string or `datetime` |
+| `to` | `datetime \| str` | UTC end |
+
+ISO strings are parsed in `__post_init__`. `"Z"` suffix is accepted as `+00:00`.
+
+---
+
+### `ActiveBetween`
+
+Restricts checks to a recurring daily or weekly time window:
+
+```python
+from watchdiff import ActiveBetween
+
+ab = ActiveBetween(
+    from_="09:00",
+    to="17:00",
+    days=[0, 1, 2, 3, 4],   # 0=Monday … 6=Sunday. None = every day
+    timezone="Europe/Paris", # IANA name. None = UTC
+)
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `from_` | `str` | — | Window start as `"HH:MM"` |
+| `to` | `str` | — | Window end as `"HH:MM"`. If before `from_`, treated as overnight |
+| `days` | `list[int] \| None` | `None` | Weekdays to restrict to (`0`=Mon). `None` = every day |
+| `timezone` | `str \| None` | `None` | IANA timezone name (e.g. `"America/New_York"`). `None` = UTC |
+
+---
+
+### `FailurePolicy`
+
+Gates `on_error` to avoid alert noise from transient blips:
+
+```python
+from watchdiff import FailurePolicy
+
+fp = FailurePolicy(
+    consecutive_failures=3,   # fire on_error only after this many consecutive failures
+    recovery_checks=2,        # require this many consecutive successes to clear failure state
+    respect_retry_after=True, # honour Retry-After response header if present
+)
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `consecutive_failures` | `int` | `3` | Minimum consecutive failures before `on_error` fires (TypeScript default: `1`) |
+| `recovery_checks` | `int` | `1` | Consecutive successes required to exit failure mode |
+| `respect_retry_after` | `bool` | `False` | Use `Retry-After` header delay for the next check |
+
+---
+
 ### `DbDiffReport`
 
 Returned by `on_change` and `DbDiffEngine.compare()`:
@@ -2053,6 +2275,7 @@ summary = db_report_summary(report) # "orders: 1 inserted"
 ```
 Commands:
   init      Generate a watchdiff.config.json template
+  validate  Check a config file for errors without starting any watchers
   run       Start continuous monitoring (URL or config file)
   db        Monitor a database table for changes
   compare   Fetch two URLs and compare their content
@@ -2094,6 +2317,10 @@ Options for run:
   --log-format            Log format: text | json (default text)
   --verbose          -v   Enable debug logging
   --quiet            -q   Suppress change output
+
+Options for validate:
+  --json                  Output result as JSON (exit code 0 = valid, 1 = invalid)
+  --verbose          -v   Enable debug logging
 
 Options for db:
   --diff-mode        -m   row | schema | aggregate | value (default row)

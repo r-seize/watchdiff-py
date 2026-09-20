@@ -43,12 +43,15 @@ from watchdiff.fetcher.fetcher import Fetcher
 from watchdiff.file_fetcher import FileFetcher, file_path_from_url
 from watchdiff.json_path import extract_json_path
 from watchdiff.models import (
+    ActiveBetween,
     AlertConfig,
     BrowserOptions,
     ChangeType,
     DiffMode,
     DiffReport,
     EmailConfig,
+    FailurePolicy,
+    MaintenanceWindow,
     SilenceInfo,
     SmtpConfig,
     Snapshot,
@@ -71,6 +74,7 @@ from watchdiff.status_server import StatusServer
 from watchdiff.store import SqliteStore, Store
 
 __all__ = [
+    "ActiveBetween",
     "AiError",
     "AiErrorKind",
     "AiProvider",
@@ -98,8 +102,10 @@ __all__ = [
     "DiffReport",
     "EmailConfig",
     "Exporter",
+    "FailurePolicy",
     "Fetcher",
     "FileFetcher",
+    "MaintenanceWindow",
     "Notifier",
     "Parser",
     "SchemaChangeInfo",

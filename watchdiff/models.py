@@ -91,6 +91,10 @@ class WatchConfig:
     schedule:             str | None                     = None     # cron expression (overrides interval)
     confirm_after:        int | None                     = None     # seconds to re-fetch before confirming change
     json_path:            str | None                     = None     # JSONPath expression to extract before diffing
+    id:                   str | None                     = None     # stable watcher identity (used for pause/resume)
+    maintenance_windows:  list[MaintenanceWindow]        = field(default_factory=list)
+    active_between:       ActiveBetween | None           = None     # only check within this daily window
+    failure_policy:       FailurePolicy | None           = None     # consecutive-failure gate + recovery checks
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -123,6 +127,39 @@ class AlertConfig:
     min_changes: int       = 1
     webhook_retries: int   = 3  # retry attempts for failed webhook deliveries (0 = no retry)
     email: EmailConfig | None = None
+
+
+@dataclass
+class MaintenanceWindow:
+    """One-time window during which monitoring checks are skipped entirely."""
+
+    from_: datetime | str  # UTC start — ISO 8601 string or datetime object
+    to: datetime | str     # UTC end   — ISO 8601 string or datetime object
+
+    def __post_init__(self) -> None:
+        if isinstance(self.from_, str):
+            self.from_ = datetime.fromisoformat(self.from_.replace("Z", "+00:00"))
+        if isinstance(self.to, str):
+            self.to = datetime.fromisoformat(self.to.replace("Z", "+00:00"))
+
+
+@dataclass
+class ActiveBetween:
+    """Restrict monitoring to a recurring daily/weekly time window."""
+
+    from_: str                  # "HH:MM" start time (inclusive)
+    to: str                     # "HH:MM" end time (exclusive)
+    days: list[int] | None = None  # 0 = Monday … 6 = Sunday; None = every day
+    timezone: str | None = None    # IANA tz name (e.g. "Europe/Paris"); None = UTC
+
+
+@dataclass
+class FailurePolicy:
+    """Gate alerts on consecutive failure / recovery counts."""
+
+    consecutive_failures: int  = 3      # suppress alert until N consecutive fetch failures
+    recovery_checks: int       = 1      # require N consecutive successes before recovery
+    respect_retry_after: bool  = False  # honor Retry-After header when delaying next check
 
 
 # ---------------------------------------------------------------------------
@@ -253,18 +290,22 @@ class WatcherStatus:
     checks_count: int
     changes_count: int
     errors_count: int       = 0
-    last_status_code: int   = 0   # 0 = unknown, 200 = ok
+    last_status_code: int   = 0   # 0 = unknown / unreachable
+    id: str | None          = None
+    in_maintenance: bool    = False
 
     def as_dict(self) -> dict:
         def _iso(dt: datetime | None) -> str | None:
             return dt.isoformat() if dt else None
 
         return {
+            "id":               self.id,
             "url":              self.url,
             "label":            self.label,
             "target":           self.target,
             "interval":         self.interval,
             "paused":           self.paused,
+            "in_maintenance":   self.in_maintenance,
             "last_check_at":    _iso(self.last_check_at),
             "next_check_at":    _iso(self.next_check_at),
             "last_change_at":   _iso(self.last_change_at),

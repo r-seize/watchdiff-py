@@ -87,14 +87,13 @@ def _setup_logging(verbose: bool, log_format: str = "text") -> None:
 # Config validation
 # ---------------------------------------------------------------------------
 
-def _validate_config(data: dict[str, Any], path: Path) -> None:
+def _collect_config_errors(data: dict[str, Any]) -> list[str]:
+    """Return a list of validation error strings (empty = valid)."""
     errors: list[str] = []
 
     watchers = data.get("watchers", [])
     if not isinstance(watchers, list):
-        errors.append("'watchers' must be a list")
-        _exit_with_config_errors(errors, path)
-        return
+        return ["'watchers' must be a list"]
 
     for i, w in enumerate(watchers):
         prefix = f"watchers[{i}]"
@@ -156,6 +155,54 @@ def _validate_config(data: dict[str, Any], path: Path) -> None:
         if json_path is not None and not isinstance(json_path, str):
             errors.append(f"{prefix}.json_path: must be a string (got {type(json_path).__name__})")
 
+        watcher_id = w.get("id")
+        if watcher_id is not None and not isinstance(watcher_id, str):
+            errors.append(f"{prefix}.id: must be a string (got {type(watcher_id).__name__})")
+
+        maintenance_windows = w.get("maintenance_windows")
+        if maintenance_windows is not None:
+            if not isinstance(maintenance_windows, list):
+                errors.append(f"{prefix}.maintenance_windows: must be a list")
+            else:
+                for j, mw in enumerate(maintenance_windows):
+                    if not isinstance(mw, dict):
+                        errors.append(f"{prefix}.maintenance_windows[{j}]: must be an object")
+                    else:
+                        for mw_field in ("from", "to"):
+                            if mw_field not in mw:
+                                errors.append(f"{prefix}.maintenance_windows[{j}].{mw_field}: required")
+
+        active_between = w.get("active_between")
+        if active_between is not None:
+            if not isinstance(active_between, dict):
+                errors.append(f"{prefix}.active_between: must be an object")
+            else:
+                for ab_field in ("from", "to"):
+                    val = active_between.get(ab_field)
+                    if val is None:
+                        errors.append(f"{prefix}.active_between.{ab_field}: required (HH:MM)")
+                    elif not isinstance(val, str) or len(val.split(":")) != 2:
+                        errors.append(f"{prefix}.active_between.{ab_field}: must be HH:MM format")
+                days = active_between.get("days")
+                if days is not None and not isinstance(days, list):
+                    errors.append(f"{prefix}.active_between.days: must be a list of integers 0-6")
+
+        failure_policy = w.get("failure_policy")
+        if failure_policy is not None:
+            if not isinstance(failure_policy, dict):
+                errors.append(f"{prefix}.failure_policy: must be an object")
+            else:
+                for fp_field in ("consecutive_failures", "recovery_checks"):
+                    val = failure_policy.get(fp_field)
+                    if val is not None and (not isinstance(val, int) or val < 1):
+                        errors.append(f"{prefix}.failure_policy.{fp_field}: must be a positive integer")
+
+    return errors
+
+
+def _validate_config(data: dict[str, Any], path: Path) -> None:
+    """Validate config and exit with errors if invalid (used by run/db commands)."""
+    errors = _collect_config_errors(data)
     if errors:
         _exit_with_config_errors(errors, path)
 
@@ -170,6 +217,41 @@ def _exit_with_config_errors(errors: list[str], path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+@app.command("validate")
+def cmd_validate(
+    config_file: str  = typer.Argument(_CONFIG_FILE, help="Config file to validate."),
+    output_json: bool = typer.Option(False, "--json", help="Output result as JSON."),
+    verbose: bool     = _VERBOSE_OPT,
+) -> None:
+    """Check a config file for errors without starting any watchers."""
+    _setup_logging(verbose)
+    path = Path(config_file)
+    if not path.exists():
+        if output_json:
+            print(json.dumps({"valid": False, "errors": [f"File not found: {path}"]}))
+        else:
+            console.print(f"[red]File not found:[/] {path}")
+        raise typer.Exit(1)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        if output_json:
+            print(json.dumps({"valid": False, "errors": [f"Invalid JSON: {exc}"]}))
+        else:
+            console.print(f"[red]Invalid JSON in {path}:[/] {exc}")
+        raise typer.Exit(1)
+    errors = _collect_config_errors(data)
+    count = len(data.get("watchers", []))
+    if output_json:
+        print(json.dumps({"valid": not errors, "watchers": count, "errors": errors}))
+        if errors:
+            raise typer.Exit(1)
+    elif errors:
+        _exit_with_config_errors(errors, path)
+    else:
+        console.print(f"[green]✓[/] {path} is valid — {count} watcher(s) defined.")
+
 
 @app.command("init")
 def cmd_init(
@@ -213,6 +295,10 @@ def cmd_init(
                 "confirm_after":            None,
                 "json_path":               None,
                 "email":                    None,
+                "id":                       None,
+                "maintenance_windows":      [],
+                "active_between":           None,
+                "failure_policy":           None,
             }
         ],
     }
@@ -832,7 +918,9 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
         console.print("[yellow]No watchers defined in config file.[/]")
         raise typer.Exit(0)
 
-    from watchdiff.models import BrowserOptions, EmailConfig, SmtpConfig  # noqa: PLC0415
+    from watchdiff.models import (  # noqa: PLC0415
+        ActiveBetween, BrowserOptions, EmailConfig, FailurePolicy, MaintenanceWindow, SmtpConfig,
+    )
 
     wd = WatchDiff(storage_dir=storage)
     for w in watchers:
@@ -861,6 +949,30 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
                 smtp    = smtp,
                 from_   = raw_email.get("from"),
                 subject = raw_email.get("subject"),
+            )
+
+        maintenance_windows_cfg = [
+            MaintenanceWindow(from_=mw["from"], to=mw["to"])
+            for mw in (w.get("maintenance_windows") or [])
+        ]
+
+        active_between_cfg = None
+        raw_ab = w.get("active_between")
+        if raw_ab:
+            active_between_cfg = ActiveBetween(
+                from_    = raw_ab.get("from", "00:00"),
+                to       = raw_ab.get("to", "23:59"),
+                days     = raw_ab.get("days"),
+                timezone = raw_ab.get("timezone"),
+            )
+
+        failure_policy_cfg = None
+        raw_fp = w.get("failure_policy")
+        if raw_fp:
+            failure_policy_cfg = FailurePolicy(
+                consecutive_failures = raw_fp.get("consecutive_failures", 3),
+                recovery_checks      = raw_fp.get("recovery_checks", 1),
+                respect_retry_after  = raw_fp.get("respect_retry_after", False),
             )
 
         wd.watch(
@@ -893,6 +1005,10 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
             confirm_after            = w.get("confirm_after"),
             json_path                = w.get("json_path"),
             email                    = email_cfg,
+            id                       = w.get("id"),
+            maintenance_windows      = maintenance_windows_cfg or None,
+            active_between           = active_between_cfg,
+            failure_policy           = failure_policy_cfg,
         )
 
     wd.on_change(on_change_cb)  # type: ignore[arg-type]
