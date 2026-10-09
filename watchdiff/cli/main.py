@@ -903,7 +903,6 @@ def cmd_clean(
     yes: bool    = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
 ) -> None:
     """Delete orphan snapshot/report files not referenced by any active watcher."""
-    import glob as _glob  # noqa: PLC0415
     from watchdiff.store import Store as _Store  # noqa: PLC0415
 
     store_dir = Path(storage)
