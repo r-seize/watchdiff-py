@@ -114,6 +114,17 @@ class SqliteStore:
         )
         self._conn.commit()
 
+    def prune_snapshots_by_age(self, url: str, target: str | None, days: int) -> None:
+        """Delete snapshots older than `days` days."""
+        from datetime import timezone  # noqa: PLC0415
+        key     = self._key(url, target)
+        cutoff  = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "DELETE FROM snapshots WHERE url_key = ? AND captured_at < datetime(?, ?)",
+            (key, cutoff, f"-{days} days"),
+        )
+        self._conn.commit()
+
     def clear_history(self, url: str, target: str | None) -> None:
         """Delete all snapshots and reports for a URL + target combo."""
         key = self._key(url, target)

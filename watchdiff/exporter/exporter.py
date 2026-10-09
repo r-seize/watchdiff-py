@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from watchdiff.store.store import Store
 
 _SNAP_HEADERS = ["url", "target", "captured_at", "checksum", "content_preview"]
-_REP_HEADERS  = ["url", "target", "label", "compared_at", "added", "removed", "modified", "total"]
+_REP_HEADERS  = ["url", "label", "compared_at", "kind", "before", "after"]
 
 
 class Exporter:
@@ -142,6 +142,38 @@ class Exporter:
         return self._write_xlsx(_REP_HEADERS, rows, dest)
 
     # ------------------------------------------------------------------
+    # Public API - JSON
+    # ------------------------------------------------------------------
+
+    def snapshots_json(
+        self,
+        url: str,
+        target: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Return snapshots as a list of dicts (newest last)."""
+        snapshots = self._store.load_history(url, target, limit=limit)
+        return [
+            {
+                "url":         s.url,
+                "target":      s.target,
+                "captured_at": s.captured_at.isoformat(),
+                "checksum":    s.checksum,
+                "content":     s.content,
+            }
+            for s in snapshots
+        ]
+
+    def reports_json(
+        self,
+        url: str,
+        target: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Return diff reports as a list of dicts (newest last)."""
+        return self._store.load_reports(url, target, limit=limit)
+
+    # ------------------------------------------------------------------
     # Internal - data collection
     # ------------------------------------------------------------------
 
@@ -162,20 +194,18 @@ class Exporter:
         reports = self._store.load_reports(url, target, limit=limit)
         rows = []
         for r in reports:
-            changes  = r.get("changes", [])
-            added    = sum(1 for c in changes if c.get("kind") == "added")
-            removed  = sum(1 for c in changes if c.get("kind") == "removed")
-            modified = sum(1 for c in changes if c.get("kind") == "modified")
-            rows.append([
-                r.get("url", ""),
-                r.get("target") or "",
-                r.get("label", ""),
-                r.get("compared_at", ""),
-                added,
-                removed,
-                modified,
-                len(changes),
-            ])
+            url_val      = r.get("url", "")
+            label        = r.get("label", "")
+            compared_at  = r.get("compared_at", "")
+            for c in r.get("changes", []):
+                rows.append([
+                    url_val,
+                    label,
+                    compared_at,
+                    c.get("kind", ""),
+                    (c.get("before") or "")[:500],
+                    (c.get("after") or "")[:500],
+                ])
         return rows
 
     # ------------------------------------------------------------------

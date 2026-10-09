@@ -59,8 +59,11 @@ def _pick_proxy(config: WatchConfig) -> str | None:
     return random.choice(config.proxies) if config.proxies else None
 
 
-def _backoff(attempt: int, retry_delay: float) -> float:
-    return retry_delay * (2 ** attempt)
+def _backoff(attempt: int, retry_delay: float, max_retry_delay: float | None = None) -> float:
+    delay = retry_delay * (2 ** attempt)
+    if max_retry_delay is not None:
+        delay = min(delay, max_retry_delay)
+    return delay
 
 
 class FetchError(Exception):
@@ -99,7 +102,7 @@ class Fetcher:
 
         for attempt in range(config.retries + 1):
             if attempt > 0:
-                delay = _backoff(attempt - 1, config.retry_delay)
+                delay = _backoff(attempt - 1, config.retry_delay, getattr(config, "max_retry_delay", None))
                 logger.debug("[%s] Retry %d/%d after %.1fs", config.label, attempt, config.retries, delay)
                 time.sleep(delay)
             try:
@@ -151,7 +154,7 @@ class AsyncFetcher:
 
         for attempt in range(config.retries + 1):
             if attempt > 0:
-                delay = _backoff(attempt - 1, config.retry_delay)
+                delay = _backoff(attempt - 1, config.retry_delay, getattr(config, "max_retry_delay", None))
                 logger.debug("[%s] Retry %d/%d after %.1fs", config.label, attempt, config.retries, delay)
                 await asyncio.sleep(delay)
             try:

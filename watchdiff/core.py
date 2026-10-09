@@ -149,6 +149,11 @@ class WatchDiff:
         maintenance_windows: list[MaintenanceWindow] | None                                    = None,
         active_between: ActiveBetween | None                                                   = None,
         failure_policy: FailurePolicy | None                                                   = None,
+        on_recovery: Callable[[WatchConfig], None] | None                                      = None,
+        max_retry_delay: float | None                                                          = None,
+        alert_on_first_check: bool                                                             = False,
+        webhook_headers: dict[str, str] | None                                                 = None,
+        retention_days: int | None                                                             = None,
     ) -> WatchDiff:
         """
         Register a URL to monitor.
@@ -248,6 +253,11 @@ class WatchDiff:
             maintenance_windows      = maintenance_windows or [],
             active_between           = active_between,
             failure_policy           = failure_policy,
+            on_recovery              = on_recovery,
+            max_retry_delay          = max_retry_delay,
+            alert_on_first_check     = alert_on_first_check,
+            webhook_headers          = webhook_headers or {},
+            retention_days           = retention_days,
         )
         self._configs.append(config)
         return self
@@ -819,6 +829,36 @@ class WatchDiff:
         """
         from watchdiff.exporter import Exporter  # noqa: PLC0415
         return Exporter(self._store).reports_xlsx(url, target, limit=limit, dest=dest)
+
+    def export_snapshots_json(
+        self,
+        url: str,
+        target: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """
+        Return snapshots as a list of dicts (newest last).
+
+        Returns:
+            List of snapshot dicts with url, target, captured_at, checksum, content.
+        """
+        from watchdiff.exporter import Exporter  # noqa: PLC0415
+        return Exporter(self._store).snapshots_json(url, target, limit=limit)
+
+    def export_reports_json(
+        self,
+        url: str,
+        target: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """
+        Return diff reports as a list of dicts (newest last).
+
+        Returns:
+            List of report dicts as produced by DiffReport.as_dict().
+        """
+        from watchdiff.exporter import Exporter  # noqa: PLC0415
+        return Exporter(self._store).reports_json(url, target, limit=limit)
 
     # ------------------------------------------------------------------
     # Status server

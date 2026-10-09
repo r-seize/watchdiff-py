@@ -84,6 +84,57 @@ def _setup_logging(verbose: bool, log_format: str = "text") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Config normalisation (camelCase ↔ snake_case + watches/watchers alias)
+# ---------------------------------------------------------------------------
+
+_CAMEL_TO_SNAKE: dict[str, str] = {
+    "diffMode":             "diff_mode",
+    "ignoreSelectors":      "ignore_selectors",
+    "ignorePatterns":       "ignore_patterns",
+    "webhookRetries":       "webhook_retries",
+    "browserOptions":       "browser_options",
+    "waitFor":              "wait_for",
+    "waitForSelector":      "wait_for_selector",
+    "maxSnapshots":         "max_snapshots",
+    "changeThreshold":      "change_threshold",
+    "ignoreNumbers":        "ignore_numbers",
+    "alertIfNoChangeAfter": "alert_if_no_change_after",
+    "alertOnStatusChange":  "alert_on_status_change",
+    "confirmAfter":         "confirm_after",
+    "jsonPath":             "json_path",
+    "maintenanceWindows":   "maintenance_windows",
+    "activeBetween":        "active_between",
+    "failurePolicy":        "failure_policy",
+    "consecutiveFailures":  "consecutive_failures",
+    "recoveryChecks":       "recovery_checks",
+    "respectRetryAfter":    "respect_retry_after",
+    "retryDelay":           "retry_delay",
+    "dryRun":               "dry_run",
+    "userAgents":           "user_agents",
+    "onRecovery":           "on_recovery",
+    "maxRetryDelay":        "max_retry_delay",
+    "alertOnFirstCheck":    "alert_on_first_check",
+    "webhookHeaders":       "webhook_headers",
+    "retentionDays":        "retention_days",
+}
+
+
+def _normalize_watcher(w: dict) -> dict:
+    """Convert camelCase keys to snake_case for a single watcher dict."""
+    return {_CAMEL_TO_SNAKE.get(k, k): v for k, v in w.items()}
+
+
+def _normalize_config(data: dict) -> dict:
+    """Accept watches[] or watchers[], normalize all watcher keys."""
+    if "watches" in data and "watchers" not in data:
+        data = {**data, "watchers": data["watches"]}
+    watchers = data.get("watchers", [])
+    if isinstance(watchers, list):
+        data = {**data, "watchers": [_normalize_watcher(w) for w in watchers]}
+    return data
+
+
+# ---------------------------------------------------------------------------
 # Config validation
 # ---------------------------------------------------------------------------
 
@@ -91,9 +142,10 @@ def _collect_config_errors(data: dict[str, Any]) -> list[str]:
     """Return a list of validation error strings (empty = valid)."""
     errors: list[str] = []
 
+    data = _normalize_config(data)
     watchers = data.get("watchers", [])
     if not isinstance(watchers, list):
-        return ["'watchers' must be a list"]
+        return ["'watchers' (or 'watches') must be a list"]
 
     for i, w in enumerate(watchers):
         prefix = f"watchers[{i}]"
@@ -241,8 +293,9 @@ def cmd_validate(
         else:
             console.print(f"[red]Invalid JSON in {path}:[/] {exc}")
         raise typer.Exit(1)
+    data   = _normalize_config(data)
     errors = _collect_config_errors(data)
-    count = len(data.get("watchers", []))
+    count  = len(data.get("watchers", []))
     if output_json:
         print(json.dumps({"valid": not errors, "watchers": count, "errors": errors}))
         if errors:
@@ -637,6 +690,7 @@ def cmd_status(
         console.print(f"[red]Failed to read config:[/] {exc}")
         raise typer.Exit(1)
 
+    data     = _normalize_config(data)
     store    = Store(data.get("storage", storage))
     watchers = data.get("watchers", [])
 
@@ -769,14 +823,25 @@ def cmd_export(
         console.print("[red]--type must be 'reports' or 'snapshots'[/]")
         raise typer.Exit(1)
 
-    if export_format not in ("csv", "xlsx"):
-        console.print("[red]--format must be 'csv' or 'xlsx'[/]")
+    if export_format not in ("csv", "xlsx", "json"):
+        console.print("[red]--format must be 'csv', 'xlsx', or 'json'[/]")
         raise typer.Exit(1)
 
     store    = Store(storage)
     exporter = Exporter(store)
 
-    if export_format == "csv":
+    if export_format == "json":
+        if export_type == "reports":
+            data = exporter.reports_json(url, target, limit=limit)
+        else:
+            data = exporter.snapshots_json(url, target, limit=limit)
+        text = json.dumps(data, indent=2, ensure_ascii=False)
+        if output:
+            _Path(output).write_text(text, encoding="utf-8")
+            console.print(f"[green]Exported[/] {export_type} to [yellow]{output}[/]")
+        else:
+            typer.echo(text)
+    elif export_format == "csv":
         if export_type == "reports":
             result = exporter.reports_csv(url, target, limit=limit,
                                           dest=_Path(output) if output else None)
@@ -794,6 +859,129 @@ def cmd_export(
         else:
             path = exporter.snapshots_xlsx(url, target, limit=limit, dest=dest)
         console.print(f"[green]Exported[/] {export_type} to [yellow]{path}[/]")
+
+
+@app.command("snapshot")
+def cmd_snapshot(
+    url: str           = _URL_ARG,
+    target: str | None = _TARGET_OPT,
+    storage: str       = _STORAGE_OPT,
+    output_json: bool  = typer.Option(False, "--json", help="Output snapshot as JSON."),
+) -> None:
+    """Show the last stored snapshot for a URL."""
+    from watchdiff.store import Store as _Store  # noqa: PLC0415
+
+    store = _Store(storage)
+    snap  = store.load_latest(url, target)
+
+    if snap is None:
+        console.print(f"[yellow]No snapshot found[/] for {url!r}. Run [bold]watchdiff check {url}[/] first.")
+        raise typer.Exit(1)
+
+    if output_json:
+        typer.echo(json.dumps({
+            "url":         snap.url,
+            "target":      snap.target,
+            "captured_at": snap.captured_at.isoformat(),
+            "checksum":    snap.checksum,
+            "content":     snap.content,
+        }, indent=2, ensure_ascii=False))
+    else:
+        table = Table(show_header=False, box=None)
+        table.add_row("[bold]URL[/]",         snap.url)
+        table.add_row("[bold]Target[/]",      snap.target or "(full page)")
+        table.add_row("[bold]Captured at[/]", snap.captured_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
+        table.add_row("[bold]Checksum[/]",    snap.checksum[:16] + "…")
+        table.add_row("[bold]Content[/]",     snap.content[:300].replace("\n", " ") + ("…" if len(snap.content) > 300 else ""))
+        console.print(table)
+
+
+@app.command("clean")
+def cmd_clean(
+    storage: str = _STORAGE_OPT,
+    config:  str = typer.Option(_CONFIG_FILE, "--config", "-c", help="Config file listing active watchers."),
+    yes: bool    = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+) -> None:
+    """Delete orphan snapshot/report files not referenced by any active watcher."""
+    import glob as _glob  # noqa: PLC0415
+    from watchdiff.store import Store as _Store  # noqa: PLC0415
+
+    store_dir = Path(storage)
+    if not store_dir.exists():
+        console.print(f"[yellow]Storage directory {storage!r} does not exist.[/]")
+        raise typer.Exit(0)
+
+    # Build the set of known keys from the config file (if it exists)
+    known_keys: set[str] = set()
+    cfg_path = Path(config)
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            data = _normalize_config(data) if isinstance(data, dict) else data
+            watchers = data if isinstance(data, list) else data.get("watchers", [])
+            store = _Store(storage)
+            for w in watchers:
+                url    = w.get("url", "")
+                target = w.get("target")
+                if url:
+                    key = store._key(url, target)
+                    known_keys.add(key)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Find all snap_* and report_* files
+    all_files = list(store_dir.glob("snap_*.json")) + list(store_dir.glob("report_*.json"))
+    orphans   = [
+        f for f in all_files
+        if not known_keys or f.stem.split("_", 1)[1] not in known_keys
+    ]
+
+    if not orphans:
+        console.print("[green]No orphan files found.[/]")
+        raise typer.Exit(0)
+
+    console.print(f"Found [yellow]{len(orphans)}[/] orphan file(s):")
+    for f in orphans:
+        console.print(f"  {f.name}")
+
+    if not yes:
+        confirmed = typer.confirm("Delete these files?")
+        if not confirmed:
+            raise typer.Abort()
+
+    for f in orphans:
+        f.unlink()
+    console.print(f"[green]Done.[/] {len(orphans)} file(s) deleted.")
+
+
+@app.command("pause")
+def cmd_pause(
+    id_or_url: str = typer.Argument(..., help="Watcher ID or URL to pause."),
+) -> None:
+    """Pause a watcher (programmatic API guidance)."""
+    console.print(
+        f"[yellow]pause/resume are only available via the Python API.[/]\n\n"
+        f"Start your scheduler with [bold]block=False[/], then call:\n\n"
+        f"  wd.start(block=False)\n"
+        f"  wd.pause({id_or_url!r})   # pause by URL or watcher id\n"
+        f"  wd.resume({id_or_url!r})  # resume\n\n"
+        f"See: https://github.com/r-seize/watchdiff-py#pause-and-resume"
+    )
+
+
+@app.command("resume")
+def cmd_resume(
+    id_or_url: str = typer.Argument(..., help="Watcher ID or URL to resume."),
+) -> None:
+    """Resume a paused watcher (programmatic API guidance)."""
+    console.print(
+        f"[yellow]pause/resume are only available via the Python API.[/]\n\n"
+        f"Start your scheduler with [bold]block=False[/], then call:\n\n"
+        f"  wd.start(block=False)\n"
+        f"  wd.pause({id_or_url!r})   # pause by URL or watcher id\n"
+        f"  wd.resume({id_or_url!r})  # resume\n\n"
+        f"See: https://github.com/r-seize/watchdiff-py#pause-and-resume"
+    )
 
 
 @app.command("db")
@@ -909,6 +1097,7 @@ def _run_from_config(path: Path, on_change_cb: object) -> None:
         console.print(f"[red]Failed to read config:[/] {exc}")
         raise typer.Exit(1)
 
+    data     = _normalize_config(data)
     _validate_config(data, path)
 
     storage  = data.get("storage", ".watchdiff")

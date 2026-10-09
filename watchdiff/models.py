@@ -95,6 +95,11 @@ class WatchConfig:
     maintenance_windows:  list[MaintenanceWindow]        = field(default_factory=list)
     active_between:       ActiveBetween | None           = None     # only check within this daily window
     failure_policy:       FailurePolicy | None           = None     # consecutive-failure gate + recovery checks
+    on_recovery:          Callable[[WatchConfig], None] | None = None  # called when watcher exits failure mode
+    max_retry_delay:      float | None                   = None     # cap on exponential backoff delay (seconds)
+    alert_on_first_check: bool                           = False    # fire on_change on the very first capture
+    webhook_headers:      dict[str, str]                 = field(default_factory=dict)  # extra headers on every webhook POST
+    retention_days:       int | None                     = None     # auto-delete snapshots older than N days
 
     def __post_init__(self) -> None:
         if not self.label:

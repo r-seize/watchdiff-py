@@ -68,6 +68,21 @@ class Store:
         if len(history) > max_snapshots:
             self._save_raw(path, history[-max_snapshots:])
 
+    def prune_snapshots_by_age(self, url: str, target: str | None, days: int) -> None:
+        """Delete snapshots older than `days` days."""
+        from datetime import timezone  # noqa: PLC0415
+        path    = self._snapshot_path(url, target)
+        history = self._load_raw(path)
+        if not history:
+            return
+        cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+        kept   = [
+            d for d in history
+            if datetime.fromisoformat(d["captured_at"]).timestamp() >= cutoff
+        ]
+        if len(kept) < len(history):
+            self._save_raw(path, kept)
+
     def get_directory(self) -> Path:
         """Return the storage directory path."""
         return self.directory

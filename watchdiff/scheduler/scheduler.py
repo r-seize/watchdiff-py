@@ -275,6 +275,12 @@ class SyncScheduler:
             self._in_failure_mode[key] = False
             self._consecutive_successes[key] = 0
             logger.info("[%s] Recovered after %d check(s)", config.label, consec_ok)
+            on_recovery = getattr(config, "on_recovery", None)
+            if on_recovery:
+                try:
+                    on_recovery(config)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] on_recovery callback error: %s", config.label, exc)
         else:
             self._consecutive_failures[key] = 0
 
@@ -323,7 +329,17 @@ class SyncScheduler:
         if previous is None:
             if not config.dry_run:
                 self._store.save_snapshot(snapshot)
+                self._prune_retention(config)
             logger.info("[%s] First snapshot captured.", config.label)
+            if getattr(config, "alert_on_first_check", False):
+                from watchdiff.models import Snapshot as _EmptySnap  # noqa: PLC0415
+                empty = _EmptySnap(url=config.url, target=config.target, content="", raw_html="")
+                first_report = self._engine.compare(empty, snapshot, config)
+                first_report.compared_at = snapshot.captured_at
+                if response_time_ms is not None:
+                    first_report.response_time_ms = response_time_ms
+                self._dispatch(config, first_report, key)
+                return first_report
             return None
 
         report = self._engine.compare(previous, snapshot, config)
@@ -334,6 +350,7 @@ class SyncScheduler:
             self._store.save_snapshot(snapshot)
             if config.max_snapshots and hasattr(self._store, "prune_snapshots"):
                 self._store.prune_snapshots(config.url, config.target, config.max_snapshots)
+            self._prune_retention(config)
 
         if report.has_changes:
             confirm_after = getattr(config, "confirm_after", None)
@@ -492,7 +509,7 @@ class SyncScheduler:
 
                 if config.alert:
                     if not config.dry_run:
-                        self._notifier.notify(report, config.alert)
+                        self._notifier.notify(report, config.alert, config)
                     else:
                         for cb in config.alert.on_change:
                             try:
@@ -511,22 +528,48 @@ class SyncScheduler:
 
         return report
 
+    def _dispatch(self, config: WatchConfig, report: DiffReport, key: str) -> None:
+        for cb in self._on_diff_callbacks:
+            try:
+                cb(report)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] Global callback error: %s", config.label, exc)
+        if config.alert and not config.dry_run:
+            try:
+                self._notifier.notify(report, config.alert, config)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] Notifier error: %s", config.label, exc)
+
+    def _prune_retention(self, config: WatchConfig) -> None:
+        days = getattr(config, "retention_days", None)
+        if not days or not hasattr(self._store, "prune_snapshots_by_age"):
+            return
+        try:
+            self._store.prune_snapshots_by_age(config.url, config.target, days)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] retention_days prune error: %s", config.label, exc)
+
     def _check_silence(self, config: WatchConfig) -> None:
-        if not config.alert_if_no_change_after or not config.on_silence:
+        if not config.alert_if_no_change_after:
             return
         key     = _cooldown_key(config)
         ref     = self._last_change_at.get(key) or self._watcher_start.get(key, time.time())
         elapsed = time.time() - ref
         if elapsed >= config.alert_if_no_change_after and not self._silence_fired.get(key, False):
             self._silence_fired[key] = True
-            try:
-                config.on_silence(SilenceInfo(
-                    url                       = config.url,
-                    label                     = config.label or config.url,
-                    seconds_since_last_change = elapsed,
-                ))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[%s] on_silence callback error: %s", config.label, exc)
+            logger.warning(
+                "[%s] No change detected for %.0fs (threshold: %ds).",
+                config.label, elapsed, config.alert_if_no_change_after,
+            )
+            if config.on_silence:
+                try:
+                    config.on_silence(SilenceInfo(
+                        url                       = config.url,
+                        label                     = config.label or config.url,
+                        seconds_since_last_change = elapsed,
+                    ))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] on_silence callback error: %s", config.label, exc)
 
     def _handle_status_change(self, key: str, current_status: int, config: WatchConfig) -> None:
         prev = self._last_status_code.get(key, 0)
@@ -776,6 +819,12 @@ class AsyncScheduler:
             self._in_failure_mode[key] = False
             self._consecutive_successes[key] = 0
             logger.info("[%s] Recovered after %d check(s)", config.label, consec_ok)
+            on_recovery = getattr(config, "on_recovery", None)
+            if on_recovery:
+                try:
+                    on_recovery(config)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] on_recovery callback error: %s", config.label, exc)
         else:
             self._consecutive_failures[key] = 0
 
@@ -824,7 +873,17 @@ class AsyncScheduler:
         if previous is None:
             if not config.dry_run:
                 self._store.save_snapshot(snapshot)
+                self._prune_retention(config)
             logger.info("[%s] First snapshot captured.", config.label)
+            if getattr(config, "alert_on_first_check", False):
+                from watchdiff.models import Snapshot as _EmptySnap  # noqa: PLC0415
+                empty = _EmptySnap(url=config.url, target=config.target, content="", raw_html="")
+                first_report = self._engine.compare(empty, snapshot, config)
+                first_report.compared_at = snapshot.captured_at
+                if response_time_ms is not None:
+                    first_report.response_time_ms = response_time_ms
+                self._dispatch(config, first_report, key)
+                return first_report
             return None
 
         report = self._engine.compare(previous, snapshot, config)
@@ -835,6 +894,7 @@ class AsyncScheduler:
             self._store.save_snapshot(snapshot)
             if config.max_snapshots and hasattr(self._store, "prune_snapshots"):
                 self._store.prune_snapshots(config.url, config.target, config.max_snapshots)
+            self._prune_retention(config)
 
         if report.has_changes:
             confirm_after = getattr(config, "confirm_after", None)
@@ -993,7 +1053,7 @@ class AsyncScheduler:
 
                 if config.alert:
                     if not config.dry_run:
-                        self._notifier.notify(report, config.alert)
+                        self._notifier.notify(report, config.alert, config)
                     else:
                         for cb in config.alert.on_change:
                             try:
@@ -1012,22 +1072,48 @@ class AsyncScheduler:
 
         return report
 
+    def _dispatch(self, config: WatchConfig, report: DiffReport, key: str) -> None:
+        for cb in self._on_diff_callbacks:
+            try:
+                cb(report)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] Global callback error: %s", config.label, exc)
+        if config.alert and not config.dry_run:
+            try:
+                self._notifier.notify(report, config.alert, config)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] Notifier error: %s", config.label, exc)
+
+    def _prune_retention(self, config: WatchConfig) -> None:
+        days = getattr(config, "retention_days", None)
+        if not days or not hasattr(self._store, "prune_snapshots_by_age"):
+            return
+        try:
+            self._store.prune_snapshots_by_age(config.url, config.target, days)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] retention_days prune error: %s", config.label, exc)
+
     def _check_silence(self, config: WatchConfig) -> None:
-        if not config.alert_if_no_change_after or not config.on_silence:
+        if not config.alert_if_no_change_after:
             return
         key     = _cooldown_key(config)
         ref     = self._last_change_at.get(key) or self._watcher_start.get(key, time.time())
         elapsed = time.time() - ref
         if elapsed >= config.alert_if_no_change_after and not self._silence_fired.get(key, False):
             self._silence_fired[key] = True
-            try:
-                config.on_silence(SilenceInfo(
-                    url                       = config.url,
-                    label                     = config.label or config.url,
-                    seconds_since_last_change = elapsed,
-                ))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[%s] on_silence callback error: %s", config.label, exc)
+            logger.warning(
+                "[%s] No change detected for %.0fs (threshold: %ds).",
+                config.label, elapsed, config.alert_if_no_change_after,
+            )
+            if config.on_silence:
+                try:
+                    config.on_silence(SilenceInfo(
+                        url                       = config.url,
+                        label                     = config.label or config.url,
+                        seconds_since_last_change = elapsed,
+                    ))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] on_silence callback error: %s", config.label, exc)
 
     async def _handle_status_change(self, key: str, current_status: int, config: WatchConfig) -> None:
         prev = self._last_status_code.get(key, 0)
