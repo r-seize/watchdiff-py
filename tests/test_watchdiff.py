@@ -224,7 +224,10 @@ class TestNotifier:
             webhooks=["https://hooks.slack.com/services/test"], webhook_retries=0
         ))
         payload = json.loads(httpx_mock.get_requests()[0].content)
-        assert "text" in payload
+        assert "blocks" in payload
+        block_types = [b["type"] for b in payload["blocks"]]
+        assert "header" in block_types
+        assert "section" in block_types
 
     def test_sends_generic_webhook(self, httpx_mock):
         httpx_mock.add_response(url="https://my-server.example.com/hook", status_code=200)
